@@ -23,17 +23,28 @@ _LIMITATIONS = [
     "relocations, loader activity, runtime modification, differing analysis images or other sources",
     "Byte equality does not establish that a particular emulator session produced the observation; "
     "that relationship is supplied by the operator",
+    "The comparison checks that the receipt is internally consistent; it does not authenticate the "
+    "running executable's identity, the origin of the supplied JSON, or the absence of memory-read "
+    "side effects, and it cannot prove the debugger was genuinely paused",
     "No percentage confidence score is implied",
 ]
 
 
-def _hex_bytes(value, length: int, label: str) -> str | None:
+def _hex_bytes(value, length: int, label: str, *, required: bool) -> str | None:
     if value is None:
+        if required:
+            raise DDTError(f"{label} are missing from the observation")
         return None
     if (not isinstance(value, str) or len(value) != length * 2
             or any(c not in "0123456789abcdefABCDEF" for c in value)):
         raise DDTError(f"{label} is not {length} bytes of hexadecimal: {value!r}")
     return value.upper()
+
+
+def _cs_ip(value, label: str) -> str:
+    if not isinstance(value, str) or ":" not in value:
+        raise DDTError(f"{label} is not a segment:offset value: {value!r}")
+    return value
 
 
 def compare(correlation: str | Path, observation: str | Path, binary: str | Path) -> dict:
@@ -73,8 +84,18 @@ def compare(correlation: str | Path, observation: str | Path, binary: str | Path
     if request.get("length") != length:
         raise DDTError(f"the observation covers {request.get('length')!r} bytes, but the "
                        f"correlation's instruction is {length} bytes")
-    runtime_hex = _hex_bytes(obs.get("bytes_hex"), length, "the observed bytes")
-    ghidra_hex = _hex_bytes(instruction.get("bytes"), length, "the Ghidra instruction bytes")
+    for field in ("read_success", "cs_ip_unchanged"):
+        if obs.get(field) is not True:
+            raise DDTError(f"the memory observation does not record {field}=true "
+                           f"({obs.get(field)!r}); refusing to compare")
+    initial = _cs_ip((obs.get("initial") or {}).get("cs_ip"), "the observation's initial CS:IP")
+    final = _cs_ip((obs.get("final") or {}).get("cs_ip"), "the observation's final CS:IP")
+    if initial != final:
+        raise DDTError(f"the memory observation's CS:IP changed ({initial} -> {final}) but "
+                       f"cs_ip_unchanged is true")
+    runtime_hex = _hex_bytes(obs.get("bytes_hex"), length, "the observed bytes", required=True)
+    ghidra_hex = _hex_bytes(instruction.get("bytes"), length, "the Ghidra instruction bytes",
+                            required=False)
 
     original = data[offset:offset + length]
     runtime = bytes.fromhex(runtime_hex)

@@ -84,7 +84,8 @@ _STEPS_LIMITS = _LIMITS + [
 _STEP_LINE = re.compile(
     r"CS:IP=([0-9A-Fa-f]{1,4}):([0-9A-Fa-f]{1,4})\s+AX=([0-9A-Fa-f]{1,4})\s+BX=([0-9A-Fa-f]{1,4})")
 _MEMREAD_LINE = re.compile(
-    r"MEMREAD ([0-9A-Fa-f]{1,4}):([0-9A-Fa-f]{1,4}) LEN=([0-9A-Fa-f]{1,4}) HEX=([0-9A-Fa-f]+)")
+    r"(?:DEBUG:\s*)?MEMREAD ([0-9A-Fa-f]{1,4}):([0-9A-Fa-f]{1,4})\s+LEN=([0-9A-Fa-f]{1,4})"
+    r"\s+HEX=([0-9A-Fa-f]+)")
 
 _MEMORY_LIMITS = _LIMITS + [
     "The bytes are DOSBox-X's observation of conventional RAM at the moment of the read; they are "
@@ -245,14 +246,43 @@ def _parse_step_line(raw_lines: list[str]) -> dict | None:
     return None
 
 
-def _parse_memread_line(raw_lines: list[str]) -> dict | None:
+def _parse_memread_line(raw_lines: list[str], expected_segment: str, expected_offset: str,
+                        expected_length: int) -> dict:
+    """Return the single MEMREAD data record, or raise a precise DDTError.
+
+    Only one complete data line is accepted; anything else that mentions MEMREAD
+    (a prefix/suffix, a duplicate, or a conflicting record) is rejected rather
+    than treated as a successful read.
+    """
+    records, unexpected = [], []
     for line in raw_lines:
-        match = _MEMREAD_LINE.search(line)
-        if match:
-            segment, offset, length, hex_bytes = match.groups()
-            return {"segment": f"{int(segment, 16):04X}", "offset": f"{int(offset, 16):04X}",
-                    "length": int(length, 16), "hex": hex_bytes.upper()}
-    return None
+        if "MEMREAD" not in line:
+            continue
+        match = _MEMREAD_LINE.fullmatch(line.strip())
+        if match is None:
+            unexpected.append(line)
+        else:
+            records.append(match)
+    if unexpected:
+        raise DDTError(f"unexpected MEMREAD output: {unexpected[0]!r}")
+    if not records:
+        raise DDTError(f"the MEMREAD response did not report address, length and bytes "
+                       f"({raw_lines!r})")
+    if len(records) > 1:
+        raise DDTError(f"the MEMREAD response reported {len(records)} data records, not one")
+    segment, offset, length, hex_bytes = records[0].groups()
+    segment, offset = f"{int(segment, 16):04X}", f"{int(offset, 16):04X}"
+    recorded = int(length, 16)
+    hex_bytes = hex_bytes.upper()
+    if segment != expected_segment or offset != expected_offset:
+        raise DDTError(f"the MEMREAD response is for {segment}:{offset}, "
+                       f"not {expected_segment}:{expected_offset}")
+    if recorded != expected_length:
+        raise DDTError(f"the MEMREAD response reports {recorded} bytes, not {expected_length}")
+    if len(hex_bytes) != expected_length * 2:
+        raise DDTError(f"the MEMREAD response returned {len(hex_bytes) // 2} bytes of hex, "
+                       f"not {expected_length}")
+    return {"segment": segment, "offset": offset, "length": recorded, "hex": hex_bytes}
 
 
 def _differences(before: dict | None, after: dict | None) -> dict:
@@ -413,18 +443,7 @@ def capture_memory(port: int = DEFAULT_PORT, *, segment: int, offset: int, lengt
         commands.append(read_response)
         if read_response["status"] != "OK":
             raise DDTError(f"the debugger refused the memory read: {read_response['raw']}")
-        parsed = _parse_memread_line(read_response["raw"])
-        if parsed is None:
-            raise DDTError(f"the MEMREAD response did not report address, length and bytes "
-                           f"({read_response['raw']!r})")
-        if parsed["segment"] != _hex16(segment) or parsed["offset"] != _hex16(offset):
-            raise DDTError(f"the MEMREAD response is for {parsed['segment']}:{parsed['offset']}, "
-                           f"not {requested}")
-        if parsed["length"] != length:
-            raise DDTError(f"the MEMREAD response reports {parsed['length']} bytes, not {length}")
-        if len(parsed["hex"]) != length * 2:
-            raise DDTError(f"the MEMREAD response returned {len(parsed['hex']) // 2} bytes of hex, "
-                           f"not {length}")
+        parsed = _parse_memread_line(read_response["raw"], _hex16(segment), _hex16(offset), length)
         final = observe_registers(conn)
         if final["cs_ip"] != initial["cs_ip"]:
             raise DDTError(f"CS:IP moved during the memory read ({initial['cs_ip']} -> "

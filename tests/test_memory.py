@@ -37,10 +37,17 @@ def _correlation(data: bytes, fmt: str, *, offset: int, length: int, ghidra_hex,
             "mapping": mapping, "status": "conditional"}
 
 
-def _observation(cs_ip: str, length: int, hex_bytes: str) -> dict:
-    return {"schema": "ddt.dosbox-memory.v1",
-            "request": {"cs_ip": cs_ip, "length": length}, "bytes_hex": hex_bytes,
-            "cs_ip_unchanged": True}
+def _observation(cs_ip: str, length: int, hex_bytes: str, *, entry: str = "0813:0100",
+                 read_success: object = True, cs_ip_unchanged: object = True,
+                 final: str | None = None) -> dict:
+    record = {"schema": "ddt.dosbox-memory.v1",
+              "request": {"cs_ip": cs_ip, "length": length}, "bytes_hex": hex_bytes,
+              "initial": {"cs_ip": entry}, "final": {"cs_ip": final or entry}}
+    if read_success is not None:
+        record["read_success"] = read_success
+    if cs_ip_unchanged is not None:
+        record["cs_ip_unchanged"] = cs_ip_unchanged
+    return record
 
 
 def _write(tmp_path, name, payload, binary=False):
@@ -102,7 +109,8 @@ def test_mz_relocation_overlap_is_reported(tmp_path):
     correlation = _write(tmp_path, "corr.json",
                          _correlation(data, "dos-mz", offset=64, length=3, ghidra_hex="000102",
                                       runtime_cs_ip="0823:0000", module_offset=0))
-    observation = _write(tmp_path, "mem.json", _observation("0823:0000", 3, "000102"))
+    observation = _write(tmp_path, "mem.json", _observation("0823:0000", 3, "000102",
+                                                            entry="0823:0000"))
     record = memory.compare(correlation, observation, binary)
     assert record["results"] == {"runtime_equals_original": True, "runtime_equals_ghidra": True,
                                  "ghidra_equals_original": True}
@@ -150,3 +158,34 @@ def test_cli_memory_compare(tmp_path):
     payload = json.loads(proc.stdout)
     assert payload["schema"] == "ddt.memory-comparison.v1"
     assert payload["results"]["runtime_equals_original"] is True
+
+
+@pytest.mark.parametrize("kwargs,match", [
+    ({"read_success": None}, "read_success"),
+    ({"read_success": False}, "read_success"),
+    ({"read_success": "true"}, "read_success"),
+    ({"cs_ip_unchanged": None}, "cs_ip_unchanged"),
+    ({"cs_ip_unchanged": False}, "cs_ip_unchanged"),
+    ({"final": "0813:0103"}, "CS:IP changed"),
+])
+def test_observation_integrity_is_required_before_any_comparison(tmp_path, kwargs, match):
+    binary = _write(tmp_path, "loop.com", COM, binary=True)
+    correlation = _write(tmp_path, "corr.json",
+                         _correlation(COM, "dos-com", offset=3, length=3, ghidra_hex="BB7856",
+                                      runtime_cs_ip="0813:0103"))
+    observation = _write(tmp_path, "mem.json", _observation("0813:0103", 3, "BB7856", **kwargs))
+    with pytest.raises(DDTError, match=match):
+        memory.compare(correlation, observation, binary)
+
+
+def test_missing_or_incomplete_runtime_bytes_are_rejected(tmp_path):
+    binary = _write(tmp_path, "loop.com", COM, binary=True)
+    correlation = _write(tmp_path, "corr.json",
+                         _correlation(COM, "dos-com", offset=3, length=3, ghidra_hex="BB7856",
+                                      runtime_cs_ip="0813:0103"))
+    missing = _write(tmp_path, "missing.json", _observation("0813:0103", 3, None))
+    with pytest.raises(DDTError, match="observed bytes are missing"):
+        memory.compare(correlation, missing, binary)
+    incomplete = _write(tmp_path, "incomplete.json", _observation("0813:0103", 3, "BB78"))
+    with pytest.raises(DDTError, match="not 3 bytes of hexadecimal"):
+        memory.compare(correlation, incomplete, binary)

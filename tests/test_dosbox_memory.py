@@ -87,10 +87,26 @@ class _FakeMemoryDOSBox(threading.Thread):
                 return "ERR", ["DEBUG: MEMREAD cannot read 0813:0100"]
             if self.mode == "malformed":
                 return "OK", ["DEBUG: MEMREAD done"]
+            if self.mode == "absent":
+                return "OK", ["DEBUG: memory operation completed"]
             if self.mode == "bad_address":
                 return "OK", ["DEBUG: MEMREAD 0999:0100 LEN=0008 HEX=B83412BB7856EBF8"]
             if self.mode == "bad_length":
                 return "OK", ["DEBUG: MEMREAD 0813:0100 LEN=0004 HEX=B83412BB"]
+            if self.mode == "junk_suffix":
+                return "OK", [f"DEBUG: MEMREAD {seg_off} LEN={length} HEX=B83412BB7856EBF8 junk"]
+            if self.mode == "substring":
+                return "OK", [f"note: DEBUG: MEMREAD {seg_off} LEN={length} HEX=B83412BB7856EBF8"]
+            if self.mode == "duplicate":
+                line = f"DEBUG: MEMREAD {seg_off} LEN={length} HEX=B83412BB7856EBF8"
+                return "OK", [line, line]
+            if self.mode == "conflict":
+                return "OK", [f"DEBUG: MEMREAD {seg_off} LEN={length} HEX=B83412BB7856EBF8",
+                              "DEBUG: MEMREAD 0999:0100 LEN=0008 HEX=DEADBEEFDEADBEEF"]
+            if self.mode == "bad_hex":
+                return "OK", [f"DEBUG: MEMREAD {seg_off} LEN={length} HEX=B8341G"]
+            if self.mode == "odd_hex":
+                return "OK", [f"DEBUG: MEMREAD {seg_off} LEN={length} HEX=B8341"]
             hex_bytes = "B83412" if self.mode == "short_hex" else "B83412BB7856EBF8"
             return "OK", [f"DEBUG: MEMREAD {seg_off} LEN={length} HEX={hex_bytes}"]
         return "ERR", ["*** Debugger command not recognized"]
@@ -140,10 +156,17 @@ def test_unsupported_build_never_reads_memory():
 
 @pytest.mark.parametrize("mode,match", [
     ("err", "refused the memory read"),
-    ("malformed", "did not report address"),
+    ("malformed", "unexpected MEMREAD output"),
+    ("absent", "did not report address"),
     ("bad_address", "is for 0999:0100"),
     ("bad_length", "reports 4 bytes"),
     ("short_hex", "returned 3 bytes"),
+    ("junk_suffix", "unexpected MEMREAD output"),
+    ("substring", "unexpected MEMREAD output"),
+    ("bad_hex", "unexpected MEMREAD output"),
+    ("odd_hex", "returned 2 bytes"),
+    ("duplicate", "reported 2 data records"),
+    ("conflict", "reported 2 data records"),
 ])
 def test_malformed_or_mismatched_reads_are_rejected(mode, match):
     port = _free_port()
