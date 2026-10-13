@@ -136,7 +136,16 @@ GitHub Actions `.github/workflows/build.yml` runs the tests and produces PyInsta
 
 The tools never modify original files, do not infer runtime behavior from static layout, and never claim that an MZ load-module offset is an observed runtime segment:offset address. COM files are headerless and must be requested explicitly. The per-file processing limit is 64 MiB. No proprietary binaries or save files are included.
 
-**Read-only guarantees versus runtime effects.** DDT never modifies original executables, and never writes to saved Ghidra analysis projects — inspection, identification, diff/manifest and comparison commands are read-only, as are `MEMREAD`/`capture-memory` (they observe guest RAM without writing anything). Runtime stepping is the deliberate exception: `STEPIN`/`capture-steps`/`capture-step-memory` **execute guest instructions and therefore change guest runtime state**. DDT never writes guest memory, guest-drive files or host files through the debugger, and never issues `RUN`, `BREAK` or a resume of its own accord.
+**Read-only guarantees versus runtime effects.** DDT never modifies original executables, and never writes to saved Ghidra analysis projects — inspection, identification, diff/manifest and comparison commands are read-only, as are `MEMREAD`/`capture-memory` (they observe guest RAM without writing anything). DDT never writes guest memory, guest-drive files or host files through the debugger.
+
+Guest **execution** is a separate matter, and execution control is per command:
+
+- `capture-memory` and `capture-step-memory`: issue neither `RUN` nor `BREAK` (they require the debugger to be stopped already, and `capture-step-memory` executes exactly one instruction via `STEPIN`).
+- `capture-steps`: issues no `RUN` unless `--resume` is given; `STEPIN` executes guest instructions, so stepping changes guest runtime state.
+- `capture-cpu`: issues `BREAK` to stop the guest, then `RUN` to resume it (or leaves it stopped with `--leave-paused`).
+- `capture-breakpoint`: installs one breakpoint, issues `RUN` to reach it, deletes its own breakpoint and resumes unless `--leave-paused` is given — letting the guest run is itself a change to guest runtime state, and its "hit" is an observed stop, not a verified breakpoint event.
+
+`STEPIN`/`capture-steps`/`capture-step-memory` are therefore the deliberate exceptions to DDT's read-only stance: they **execute guest instructions and change guest runtime state**, while memory reads remain pure observations.
 
 ## Project direction: DOS format support
 
