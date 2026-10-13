@@ -143,7 +143,7 @@ def test_changed_byte_across_one_instruction():
     peer = _FakeStepMemoryDOSBox(port, memory_writes={0: 0x5A}, registers_after={"AX": "1234"})
     record, error, _ = _run(port, peer)
     assert error is None
-    assert record["schema"] == "ddt.dosbox-step-memory.v1"
+    assert record["schema"] == "ddt.dosbox-step-memory.v2"
     assert record["capability"] == {"checked_with": "EXEC HELP", "memread_advertised": True,
                                     "stepin_advertised": True,
                                     "evidence": ["MEMREAD <seg>:<off> <len> - Read 1-256 "
@@ -159,6 +159,12 @@ def test_changed_byte_across_one_instruction():
     assert record["register_differences"] == {"AX": ["0000", "1234"], "IP": ["0100", "0103"]}
     assert record["step"]["reported"]["cs_ip"] == "0813:0103"
     assert record["checks"]["step_report_matches_registers"] is True
+    assert record["stepin_acknowledged"] is True
+    assert record["resume_requested"] is False
+    assert record["paused_state"] == "unknown"
+    assert record["checks"]["no_run_or_resume_issued"] is True
+    assert "execution_left_stopped" not in record
+    assert any("remains unverified" in limit for limit in record["limits"])
 
 
 def test_unchanged_region_with_a_register_only_instruction():

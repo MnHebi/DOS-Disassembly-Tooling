@@ -24,7 +24,7 @@ SCHEMA = "ddt.dosbox-cpu.v1"
 BREAKPOINT_SCHEMA = "ddt.dosbox-breakpoint.v2"
 STEPS_SCHEMA = "ddt.dosbox-steps.v1"
 MEMORY_SCHEMA = "ddt.dosbox-memory.v1"
-STEP_MEMORY_SCHEMA = "ddt.dosbox-step-memory.v1"
+STEP_MEMORY_SCHEMA = "ddt.dosbox-step-memory.v2"
 PROTOCOL = "dosbox-x debugger control (line-oriented REQ/BEGIN/END)"
 DEFAULT_PORT = 58991
 DEFAULT_TIMEOUT = 60.0
@@ -108,7 +108,10 @@ _STEP_MEMORY_LIMITS = _LIMITS + [
     "A stable CS:IP across the memory reads is a consistency observation, not proof that the "
     "debugger is internally paused",
     "No executable identity is claimed from this runtime observation alone",
-    "Execution is left stopped in the debugger after the single step",
+    "DDT issues no RUN or resume, but the protocol has no stopped-state query: whether the "
+    "debugger is internally stopped remains unverified",
+    "Schema ddt.dosbox-step-memory.v2 replaces v1: the misleading execution_left_stopped field is "
+    "replaced by resume_requested, stepin_acknowledged and paused_state",
 ]
 
 
@@ -925,10 +928,13 @@ def capture_step_memory(port: int = DEFAULT_PORT, *, segment: int, offset: int, 
         "register_differences": _differences(initial["registers"], post["registers"]),
         "byte_differences": byte_differences,
         "changed_byte_count": len(byte_differences),
+        "stepin_acknowledged": step_response["status"] == "OK",
+        "resume_requested": False,
+        "paused_state": "unknown",
         "checks": {"cs_ip_unchanged_during_initial_read": True,
                    "cs_ip_unchanged_during_post_step_read": True,
                    "step_report_matches_registers": True,
-                   "execution_left_stopped": True},
+                   "no_run_or_resume_issued": True},
         "commands": commands,
         "unknown": unknown,
         "limits": list(_STEP_MEMORY_LIMITS),
