@@ -42,9 +42,14 @@ def _hex_bytes(value, length: int, label: str, *, required: bool) -> str | None:
 
 
 def _cs_ip(value, label: str) -> str:
-    if not isinstance(value, str) or ":" not in value:
+    """Validate a segment:offset observation and normalize it to SSSS:OOOO."""
+    parts = value.split(":") if isinstance(value, str) else []
+    if len(parts) != 2:
         raise DDTError(f"{label} is not a segment:offset value: {value!r}")
-    return value
+    for part in parts:
+        if not part or len(part) > 4 or any(c not in "0123456789abcdefABCDEF" for c in part):
+            raise DDTError(f"{label} is not a valid 16-bit segment:offset value: {value!r}")
+    return f"{int(parts[0], 16):04X}:{int(parts[1], 16):04X}"
 
 
 def compare(correlation: str | Path, observation: str | Path, binary: str | Path) -> dict:

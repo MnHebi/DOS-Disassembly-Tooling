@@ -189,3 +189,26 @@ def test_missing_or_incomplete_runtime_bytes_are_rejected(tmp_path):
     incomplete = _write(tmp_path, "incomplete.json", _observation("0813:0103", 3, "BB78"))
     with pytest.raises(DDTError, match="not 3 bytes of hexadecimal"):
         memory.compare(correlation, incomplete, binary)
+
+
+@pytest.mark.parametrize("value", ["813:100", "0813:0100", "FFFF:FFFF", "0:0"])
+def test_valid_cs_ip_components_are_accepted(value):
+    assert memory._cs_ip(value, "label") == f"{int(value.split(':')[0], 16):04X}:" \
+                                            f"{int(value.split(':')[1], 16):04X}"
+
+
+@pytest.mark.parametrize("value", ["08130100", "", ":0100", "0813:", "0813:01G0", "10000:0000",
+                                   "0813:10000", "0813:0100:0200", None, 0x813])
+def test_invalid_cs_ip_components_are_rejected(tmp_path, value):
+    binary = _write(tmp_path, "loop.com", COM, binary=True)
+    correlation = _write(tmp_path, "corr.json",
+                         _correlation(COM, "dos-com", offset=3, length=3, ghidra_hex="BB7856",
+                                      runtime_cs_ip="0813:0103"))
+    observation = _write(tmp_path, "mem.json", {"schema": "ddt.dosbox-memory.v1",
+                                                "request": {"cs_ip": "0813:0103", "length": 3},
+                                                "bytes_hex": "BB7856", "read_success": True,
+                                                "cs_ip_unchanged": True,
+                                                "initial": {"cs_ip": value},
+                                                "final": {"cs_ip": value}})
+    with pytest.raises(DDTError, match="is not a"):
+        memory.compare(correlation, observation, binary)
