@@ -11,11 +11,12 @@ from .capture import intake
 from .code import callees, callers, readers, writers
 from .correlate import correlate
 from .diff import compare, manifest
-from .dosbox import capture_breakpoint, capture_cpu, capture_steps
+from .dosbox import capture_breakpoint, capture_cpu, capture_memory, capture_steps
 from .errors import DDTError
 from .format import inspect, map_address
 from .ghidra import export_function
 from .identify import identify
+from .memory import compare as compare_memory
 from .strings import extract
 
 
@@ -107,6 +108,24 @@ def main(argv: list[str] | None = None) -> int:
     cst.add_argument("--resume", action="store_true",
                      help="Run the emulator after the steps complete (default: leave stopped)")
     cst.add_argument("--json", action="store_true")
+    cm = dbg_sub.add_parser("capture-memory",
+                            help="Read bounded conventional RAM from a stopped DOSBox-X debugger")
+    cm.add_argument("--port", type=int, default=58991, help="Loopback port DOSBox-X connects back to")
+    cm.add_argument("--segment", required=True, type=_num, help="Real-mode segment (e.g. 0x0813)")
+    cm.add_argument("--offset", required=True, type=_num, help="Real-mode offset (e.g. 0x0100)")
+    cm.add_argument("--length", required=True, type=int, help="Bytes to read (1..256)")
+    cm.add_argument("--out", type=Path, default=None, help="Write the observation JSON here")
+    cm.add_argument("--settle", type=float, default=3.0, help="Seconds to wait after connect")
+    cm.add_argument("--timeout", type=float, default=60.0, help="Seconds to wait for the connection")
+    cm.add_argument("--dosbox-version", default=None, help="Record an operator-known DOSBox-X version")
+    cm.add_argument("--json", action="store_true")
+    mem = commands.add_parser("memory", help="Compare observed guest memory with static evidence")
+    mem_sub = mem.add_subparsers(dest="memory_command", required=True)
+    mc = mem_sub.add_parser("compare", help="Compare original, Ghidra and runtime instruction bytes")
+    mc.add_argument("--correlation", required=True, type=Path, help="ddt.address-correlation.v1 JSON")
+    mc.add_argument("--observation", required=True, type=Path, help="ddt.dosbox-memory.v1 JSON")
+    mc.add_argument("--binary", required=True, type=Path, help="Original COM or MZ executable")
+    mc.add_argument("--json", action="store_true")
     gh = commands.add_parser("ghidra", help="Optional read-only Ghidra integration")
     gh_sub = gh.add_subparsers(dest="ghidra_command", required=True)
     gx = gh_sub.add_parser("export", help="Export one analyzed function from an existing Ghidra project")
@@ -159,10 +178,16 @@ def main(argv: list[str] | None = None) -> int:
                                             settle=args.settle, timeout=args.timeout,
                                             confirm=args.confirm, dosbox_version=args.dosbox_version,
                                             out=args.out, leave_paused=args.leave_paused)
+            elif args.debugger_command == "capture-memory":
+                output = capture_memory(args.port, segment=args.segment, offset=args.offset,
+                                        length=args.length, settle=args.settle, timeout=args.timeout,
+                                        dosbox_version=args.dosbox_version, out=args.out)
             else:
                 output = capture_steps(args.port, count=args.count, settle=args.settle,
                                        timeout=args.timeout, dosbox_version=args.dosbox_version,
                                        out=args.out, resume=args.resume)
+        elif args.command == "memory":
+            output = compare_memory(args.correlation, args.observation, args.binary)
         elif args.command == "ghidra":
             output = export_function(args.project, args.program, args.function, args.out,
                                      ghidra=args.ghidra, java_home=args.java_home, timeout=args.timeout)
