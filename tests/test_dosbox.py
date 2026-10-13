@@ -246,13 +246,16 @@ def test_leave_paused_skips_resume():
 
 class _FakeBreakpointDOSBox(threading.Thread):
     def __init__(self, port, *, install_state="0813:0100", stop_state="0813:0103",
-                 pre_existing=(), ignore_install=False):
+                 pre_existing=(), ignore_install=False, install_address=None,
+                 refuse_delete=False, fail_bplist_after=None, drop_on=None):
         super().__init__(daemon=True)
         self.port, self.install_state, self.stop_state = port, install_state, stop_state
         self.bps = {}
         for index, entry in enumerate(pre_existing):
             self.bps[f"{index:02d}"] = entry
         self.ignore_install, self.seen, self.cs_ip_calls = ignore_install, [], 0
+        self.install_address, self.refuse_delete = install_address, refuse_delete
+        self.fail_bplist_after, self.drop_on, self.bplist_calls = fail_bplist_after, drop_on, 0
 
     def run(self):
         deadline = time.time() + 3.0
@@ -279,6 +282,8 @@ class _FakeBreakpointDOSBox(threading.Thread):
                     parts = raw.decode().split(" ", 2)
                     rid, command = parts[1], parts[2]
                     self.seen.append(command)
+                    if self.drop_on is not None and command.startswith(self.drop_on):
+                        return
                     status, lines = self._reply(command)
                     conn.sendall(("\n".join([f"BEGIN {rid} {status}", *lines, f"END {rid}"]) + "\n").encode())
         finally:
@@ -292,11 +297,16 @@ class _FakeBreakpointDOSBox(threading.Thread):
         if command.startswith("EXEC BP "):
             if not self.ignore_install:
                 number = f"{len(self.bps):02d}"
-                self.bps[number] = f"{number}. BP {command.split()[2]}"
+                self.bps[number] = f"{number}. BP {self.install_address or command.split()[2]}"
             return "OK", ["DEBUG: Set breakpoint"]
         if command == "EXEC BPLIST":
+            self.bplist_calls += 1
+            if self.fail_bplist_after is not None and self.bplist_calls > self.fail_bplist_after:
+                return "ERR", ["*** BPLIST failed"]
             return "OK", ["Breakpoint list:", "-" * 10, *self.bps.values()]
         if command.startswith("EXEC BPDEL "):
+            if self.refuse_delete:
+                return "ERR", ["*** Breakpoint deletion refused"]
             self.bps.pop(command.split()[2], None)
             return "OK", ["DEBUG: Breakpoint deletion success."]
         if command == "EXEC RUN":
@@ -334,17 +344,23 @@ def test_breakpoint_hit_is_confirmed_and_cleaned_up():
     port = _free_port()
     record, error, peer = _capture_bp(port, confirm=3)
     assert error is None
-    assert record["schema"] == "ddt.dosbox-breakpoint.v1"
+    assert record["schema"] == "ddt.dosbox-breakpoint.v2"
     assert record["requested"]["cs_ip"] == "0813:0103"
-    assert record["hit_confirmed"] is True
+    assert record["target_ip_observed_stable"] is True
+    assert record["breakpoint_hit_verified"] is None and record["stop_reason"] is None
+    assert record["paused_state"] == "unknown"
     assert record["observed_stop_cs_ip"] == "0813:0103"
-    assert record["confirmation_polls"] == ["0813:0103"] * 3
+    assert record["confirmation"] == {"count": 3, "polls": ["0813:0103"] * 3}
     assert record["breakpoint"]["number"] == "00"
-    assert record["cleanup"]["deleted"] is True and record["cleanup"]["list_after_delete"] == []
-    assert record["resumed"] is True and record["left_paused"] is False
+    assert record["breakpoint"]["address_matches_requested"] is True
+    assert record["cleanup"] == {"number": "00", "delete_acknowledged": True,
+                                 "final_list_verified": True, "removal_verified": True,
+                                 "list_after_delete": []}
+    assert record["run_acknowledged"] is True and record["left_paused"] is False
     assert record["registers"]["AX"] == "1234"
     assert record["install_time_cs_ip"] == "0813:0100"
     assert any("no asynchronous breakpoint-hit event" in limit for limit in record["limits"])
+    assert any("observational evidence" in limit for limit in record["limits"])
 
 
 def test_unrelated_user_breakpoint_is_preserved():
@@ -354,7 +370,7 @@ def test_unrelated_user_breakpoint_is_preserved():
     assert error is None
     assert record["breakpoint"]["number"] == "01"
     assert record["cleanup"]["list_after_delete"] == ["00. BP 0813:0200"]
-    assert record["cleanup"]["deleted"] is True
+    assert record["cleanup"]["removal_verified"] is True
 
 
 def test_missing_hit_is_reported_and_cleaned_up():
@@ -383,7 +399,7 @@ def test_breakpoint_validation_and_leave_paused():
     port = _free_port()
     record, error, peer = _capture_bp(port, confirm=2, leave_paused=True)
     assert error is None
-    assert record["left_paused"] is True and record["resumed"] is False
+    assert record["left_paused"] is True and record["run_acknowledged"] is False
 
 
 def test_cli_capture_breakpoint(tmp_path):
@@ -397,5 +413,74 @@ def test_cli_capture_breakpoint(tmp_path):
                            "--settle", "0", "--timeout", "10", "--confirm", "2", "--json"],
                           check=True, capture_output=True, text=True, env=env)
     payload = json.loads(proc.stdout)
-    assert payload["hit_confirmed"] is True and payload["observed_stop_cs_ip"] == "0813:0103"
+    assert payload["target_ip_observed_stable"] is True
+    assert payload["breakpoint_hit_verified"] is None
+    assert payload["observed_stop_cs_ip"] == "0813:0103"
     peer.join(timeout=5)
+
+
+def test_stable_pointer_is_observational_not_a_verified_hit():
+    # Even when the pointer is stable at the target, DDT must not claim a verified stop.
+    port = _free_port()
+    record, error, _ = _capture_bp(port, confirm=4)
+    assert error is None
+    assert record["target_ip_observed_stable"] is True
+    assert record["breakpoint_hit_verified"] is None
+    assert record["stop_reason"] is None and record["paused_state"] == "unknown"
+    assert any("tight self-loop" in limit for limit in record["limits"])
+
+
+def test_breakpoint_owned_at_the_wrong_address_is_not_deleted():
+    port = _free_port()
+    peer = _FakeBreakpointDOSBox(port, install_address="0813:0999")
+    record, error, _ = _capture_bp(port, peer=peer, confirm=2)
+    assert record is None
+    assert "does not correspond to the requested" in str(error)
+    assert "manual" in str(error)
+    assert not any(command.startswith("EXEC BPDEL") for command in peer.seen)
+    assert peer.bps == {"00": "00. BP 0813:0999"}
+
+
+def test_failed_final_bplist_is_reported_as_unverified():
+    port = _free_port()
+    peer = _FakeBreakpointDOSBox(port, fail_bplist_after=2)  # before + after succeed, final fails
+    record, error, _ = _capture_bp(port, peer=peer, confirm=2)
+    assert error is None
+    assert record["cleanup"]["delete_acknowledged"] is True
+    assert record["cleanup"]["final_list_verified"] is False
+    assert record["cleanup"]["removal_verified"] is False
+    assert any("whether the breakpoint DDT installed was removed" in u for u in record["unknown"])
+
+
+def test_refused_bpdel_leaves_removal_unverified():
+    port = _free_port()
+    peer = _FakeBreakpointDOSBox(port, refuse_delete=True)
+    record, error, _ = _capture_bp(port, peer=peer, confirm=2)
+    assert error is None
+    assert record["cleanup"]["delete_acknowledged"] is False
+    assert record["cleanup"]["removal_verified"] is False
+    assert any("BPDEL was refused" in u for u in record["unknown"])
+    assert peer.bps == {"00": "00. BP 0813:0103"}  # still installed
+
+
+def test_connection_loss_during_cleanup_is_unverified():
+    port = _free_port()
+    peer = _FakeBreakpointDOSBox(port, drop_on="EXEC BPDEL")
+    record, error, _ = _capture_bp(port, peer=peer, confirm=2)
+    assert error is None
+    assert record["cleanup"]["final_list_verified"] is False
+    assert record["cleanup"]["removal_verified"] is False
+    assert record["run_acknowledged"] is False
+    assert any("cleanup" in u for u in record["unknown"])
+
+
+def test_failed_capture_preserves_existing_output_and_original_error(tmp_path):
+    port = _free_port()
+    out = tmp_path / "bp.json"
+    out.write_text("KEEP-ME", encoding="utf-8")
+    peer = _FakeBreakpointDOSBox(port, stop_state="0813:0106")
+    record, error, _ = _capture_bp(port, peer=peer, confirm=2, out=out)
+    assert record is None
+    assert "was not observed to stop" in str(error)
+    assert out.read_text(encoding="utf-8") == "KEEP-ME"
+    assert peer.bps == {}  # its own breakpoint was still removed during recovery

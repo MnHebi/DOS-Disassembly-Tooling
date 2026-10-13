@@ -20,7 +20,7 @@ import time
 from .errors import DDTError
 
 SCHEMA = "ddt.dosbox-cpu.v1"
-BREAKPOINT_SCHEMA = "ddt.dosbox-breakpoint.v1"
+BREAKPOINT_SCHEMA = "ddt.dosbox-breakpoint.v2"
 PROTOCOL = "dosbox-x debugger control (line-oriented REQ/BEGIN/END)"
 DEFAULT_PORT = 58991
 DEFAULT_TIMEOUT = 60.0
@@ -47,12 +47,14 @@ _LIMITS = [
 _BREAKPOINT_LIMITS = _LIMITS + [
     "DOSBox-X exposes no asynchronous breakpoint-hit event: the control channel only has "
     "PING, BREAK and EXEC, and ControlServer_SendEvent is never called",
-    "A hit is confirmed by observing CS:IP pinned to the requested address across several "
-    "differently spaced register queries after RUN, without issuing another BREAK",
-    "A tight self-loop exactly at the requested address could mimic a stopped CPU; the "
-    "observation is evidence, not a protocol-level stop notification",
-    "Only the breakpoint DDT installed is deleted; an unrelated user breakpoint at a "
-    "different slot is left untouched",
+    "target_ip_observed_stable only means repeated CS:IP observations matched the requested "
+    "address after RUN, without issuing another BREAK; it is observational evidence",
+    "breakpoint_hit_verified and stop_reason stay null: the protocol has no hit event or "
+    "stopped-state query, so a tight self-loop at the target can look identical",
+    "Schema ddt.dosbox-breakpoint.v2 replaces v1: hit_confirmed/resumed/paused_at_capture are "
+    "replaced by target_ip_observed_stable, breakpoint_hit_verified and run_acknowledged",
+    "Only the address-verified breakpoint DDT installed is deleted; unrelated user breakpoints "
+    "are preserved and BPDEL * is never used",
 ]
 
 
@@ -92,7 +94,10 @@ def _accepted_connection(port: int, timeout: float):
 
 
 def _request(conn: socket.socket, rid: int, command: str, timeout: float) -> dict:
-    conn.sendall(f"REQ {rid} {command}\n".encode("ascii"))
+    try:
+        conn.sendall(f"REQ {rid} {command}\n".encode("ascii"))
+    except OSError as exc:
+        raise DDTError(f"connection error sending request {rid}: {exc}") from exc
     deadline = time.monotonic() + timeout
     lines: list[str] = []
     buffer = b""
@@ -169,6 +174,18 @@ def _breakpoint_list(conn: socket.socket, rid: int, timeout: float) -> tuple[dic
 
 def _breakpoint_number(entry: str) -> str:
     return entry.split(".", 1)[0].strip()
+
+
+def _entry_address(entry: str) -> str | None:
+    """Normalize the runtime address of a BPLIST entry, or None if unreadable."""
+    parts = entry.split(" BP ", 1)
+    if len(parts) != 2:
+        return None
+    try:
+        segment, offset = parts[1].strip().split(":", 1)
+        return f"{int(segment, 16):04X}:{int(offset, 16):04X}"
+    except (ValueError, IndexError):
+        return None
 
 
 def _write_json(destination: Path, record: dict) -> None:
@@ -286,6 +303,9 @@ def capture_breakpoint(port: int = DEFAULT_PORT, *, segment: int, offset: int, s
     recovery_error: str | None = None
     failure: DDTError | None = None
     owned: str | None = None
+    delete_acknowledged = False
+    final_list_verified = False
+    cleanup_error: str | None = None
     registers: dict[str, str] | None = None
     polls: list[str] = []
     list_before: list[str] = []
@@ -323,7 +343,11 @@ def capture_breakpoint(port: int = DEFAULT_PORT, *, segment: int, offset: int, s
             commands.append(response)
             added = [entry for entry in list_after if entry not in list_before]
             if len(added) != 1:
-                raise DDTError(f"could not identify exactly one new breakpoint (found {len(added)})")
+                raise DDTError(f"could not identify exactly one new breakpoint (found {len(added)}); "
+                               "not deleting anything, inspect the debugger's breakpoint table manually")
+            if _entry_address(added[0]) != target:
+                raise DDTError(f"the new breakpoint {added[0]!r} does not correspond to the requested "
+                               f"{target}; not deleting it, inspect the breakpoint table manually")
             owned = _breakpoint_number(added[0])
             run = _request(conn, next_rid(), "EXEC RUN", command_timeout)
             commands.append(run)
@@ -352,16 +376,18 @@ def capture_breakpoint(port: int = DEFAULT_PORT, *, segment: int, offset: int, s
                 try:
                     delete = _request(conn, next_rid(), f"EXEC BPDEL {owned}", command_timeout)
                 except DDTError as exc:
-                    recovery_error = str(exc)
+                    cleanup_error = str(exc)
                 else:
                     commands.append(delete)
-                    if delete["status"] != "OK":
-                        recovery_error = f"BPDEL was refused: {delete['raw']}"
-                    try:
-                        response, list_final = _breakpoint_list(conn, next_rid(), command_timeout)
-                        commands.append(response)
-                    except DDTError as exc:
-                        recovery_error = recovery_error or str(exc)
+                    delete_acknowledged = delete["status"] == "OK"
+                    if not delete_acknowledged:
+                        cleanup_error = f"BPDEL was refused: {delete['raw']}"
+                try:
+                    response, list_final = _breakpoint_list(conn, next_rid(), command_timeout)
+                    commands.append(response)
+                    final_list_verified = True
+                except DDTError as exc:
+                    cleanup_error = cleanup_error or str(exc)
             if broke and not leave_paused:
                 try:
                     run = _request(conn, next_rid(), "EXEC RUN", command_timeout)
@@ -372,16 +398,23 @@ def capture_breakpoint(port: int = DEFAULT_PORT, *, segment: int, offset: int, s
                     resumed = run["status"] == "OK"
     if failure is not None:
         message = str(failure)
-        if recovery_error is not None:
-            message += f"; the debugger recovery also failed: {recovery_error}"
+        recovery = recovery_error or cleanup_error
+        if recovery is not None:
+            message += f"; the debugger recovery also failed: {recovery}"
         raise DDTError(message) from failure
 
-    deleted = owned is not None and all(owned != _breakpoint_number(e) for e in list_final)
+    removal_verified = (owned is not None and final_list_verified
+                        and all(owned != _breakpoint_number(entry) for entry in list_final))
+    if owned is not None and final_list_verified and not removal_verified:
+        cleanup_error = cleanup_error or "the breakpoint is still present in the final list"
     unknown = ["verified stop reason (the protocol exposes no breakpoint-hit event)"]
     if not dosbox_version:
         unknown.append("DOSBox-X build identity (not queried over the protocol)")
-    if not deleted:
+    unknown.append("whether the emulator is paused or running (no stopped-state query exists)")
+    if not removal_verified:
         unknown.append("whether the breakpoint DDT installed was removed")
+        if cleanup_error:
+            unknown.append(f"breakpoint cleanup: {cleanup_error}")
     if not resumed and not leave_paused:
         unknown.append("whether emulation resumed (the RUN acknowledgement was not received)")
     record = {
@@ -391,17 +424,21 @@ def capture_breakpoint(port: int = DEFAULT_PORT, *, segment: int, offset: int, s
         "dosbox_version": dosbox_version,
         "requested": {"segment": _hex16(segment), "offset": _hex16(offset), "cs_ip": target},
         "install_time_cs_ip": install_time,
-        "breakpoint": {"list_before": list_before, "list_after": list_after, "number": owned},
-        "hit_confirmed": True,
+        "breakpoint": {"list_before": list_before, "list_after": list_after, "number": owned,
+                       "address_matches_requested": True},
+        "target_ip_observed_stable": True,
+        "breakpoint_hit_verified": None,
         "observed_stop_cs_ip": polls[-1] if polls else None,
         "stop_reason": None,
-        "confirmation_polls": polls,
+        "confirmation": {"count": len(polls), "polls": polls},
         "registers": registers,
         "register_order": list(REGISTERS) if registers else None,
-        "paused_at_capture": True,
+        "paused_state": "unknown",
         "left_paused": leave_paused,
-        "resumed": resumed,
-        "cleanup": {"number": owned, "deleted": deleted, "list_after_delete": list_final},
+        "run_acknowledged": resumed,
+        "cleanup": {"number": owned, "delete_acknowledged": delete_acknowledged,
+                    "final_list_verified": final_list_verified,
+                    "removal_verified": removal_verified, "list_after_delete": list_final},
         "commands": commands,
         "unknown": unknown,
         "limits": list(_BREAKPOINT_LIMITS),
