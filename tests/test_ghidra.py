@@ -61,12 +61,14 @@ def test_resolve_project_rejects_ambiguous_or_missing(tmp_path):
 
 
 def test_build_command_is_read_only_and_explicit():
-    command = ghidra.build_command(Path("/gh/support/analyzeHeadless"), Path("/proj"), "DDT_M2",
-                                   "fixture.exe", "1000:0000", Path("/out.json"), Path("/scripts"))
+    headless, out, scripts = Path("/gh/support/analyzeHeadless"), Path("/out.json"), Path("/scripts")
+    command = ghidra.build_command(headless, Path("/proj"), "DDT_M2",
+                                   "fixture.exe", "1000:0000", out, scripts)
+    assert command[0] == str(headless)
     assert command[command.index("-process") + 1] == "fixture.exe"
     assert command[command.index("-postScript") + 1] == "ExportFunction.java"
-    assert command[command.index("-scriptPath") + 1] == "/scripts"
-    assert command[-2:] == ["1000:0000", "/out.json"]
+    assert command[command.index("-scriptPath") + 1] == str(scripts)
+    assert command[-2:] == ["1000:0000", str(out)]
     for flag in ("-readOnly", "-noanalysis"):
         assert flag in command
     for forbidden in ("-import", "-overwrite", "-commit", "-deleteProject"):
@@ -74,10 +76,10 @@ def test_build_command_is_read_only_and_explicit():
 
 
 def test_build_command_wraps_batch_launcher():
-    command = ghidra.build_command(Path("C:/gh/support/analyzeHeadless.bat"), Path("C:/proj"),
-                                   "DDT_M2", "fixture.exe", "0x0", Path("C:/out.json"),
-                                   Path("C:/scripts"))
-    assert command[:3] == ["cmd", "/c", "C:/gh/support/analyzeHeadless.bat"]
+    launcher = Path("C:/gh/support/analyzeHeadless.bat")
+    command = ghidra.build_command(launcher, Path("C:/proj"), "DDT_M2", "fixture.exe",
+                                   "0x0", Path("C:/out.json"), Path("C:/scripts"))
+    assert command[:3] == ["cmd", "/c", str(launcher)]
     assert command[command.index("-process") + 1] == "fixture.exe"
 
 
