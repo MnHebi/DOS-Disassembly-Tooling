@@ -24,6 +24,7 @@ SCHEMA = "ddt.dosbox-cpu.v1"
 BREAKPOINT_SCHEMA = "ddt.dosbox-breakpoint.v2"
 STEPS_SCHEMA = "ddt.dosbox-steps.v1"
 MEMORY_SCHEMA = "ddt.dosbox-memory.v1"
+STEP_MEMORY_SCHEMA = "ddt.dosbox-step-memory.v1"
 PROTOCOL = "dosbox-x debugger control (line-oriented REQ/BEGIN/END)"
 DEFAULT_PORT = 58991
 DEFAULT_TIMEOUT = 60.0
@@ -95,6 +96,19 @@ _MEMORY_LIMITS = _LIMITS + [
     "DOSBox-X 2026.10.01 does not provide it",
     "A memory capture does not establish the identity of the executable that produced it",
     "The read is read-only: no guest instruction is executed and the observed CS:IP is unchanged",
+]
+
+_STEP_MEMORY_LIMITS = _LIMITS + [
+    "A changed byte is evidence that the observed RAM differed between the two reads, not proof "
+    "that the single stepped instruction was the only possible cause",
+    "Zero changed bytes means no difference was observed inside the selected region; it does not "
+    "establish that the instruction wrote nothing elsewhere",
+    "Register observations cover only the registers DDT reads, not all processor state, flags or "
+    "side effects",
+    "A stable CS:IP across the memory reads is a consistency observation, not proof that the "
+    "debugger is internally paused",
+    "No executable identity is claimed from this runtime observation alone",
+    "Execution is left stopped in the debugger after the single step",
 ]
 
 
@@ -765,6 +779,159 @@ def capture_breakpoint(port: int = DEFAULT_PORT, *, segment: int, offset: int, s
         "commands": commands,
         "unknown": unknown,
         "limits": list(_BREAKPOINT_LIMITS),
+    }
+    if out is not None:
+        _write_json(Path(out), record)
+    return record
+
+
+def capture_step_memory(port: int = DEFAULT_PORT, *, segment: int, offset: int, length: int,
+                        settle: float = 3.0, timeout: float = DEFAULT_TIMEOUT,
+                        command_timeout: float = DEFAULT_COMMAND_TIMEOUT,
+                        dosbox_version: str | None = None, out: str | Path | None = None) -> dict:
+    """Observe one memory region across exactly one DOS instruction.
+
+    Reuses the existing protocol helpers on a single connection: HELP capability
+    detection, register observations, strict MEMREAD parsing and one STEPIN. The
+    memory region is an explicit runtime address, not an instruction address.
+    """
+    if not (isinstance(segment, int) and not isinstance(segment, bool) and 0 <= segment <= 0xFFFF
+            and isinstance(offset, int) and not isinstance(offset, bool) and 0 <= offset <= 0xFFFF):
+        raise DDTError(f"segment and offset must each be 0..65535: {segment!r}:{offset!r}")
+    if not isinstance(length, int) or isinstance(length, bool) or not 1 <= length <= MAX_MEMORY_BYTES:
+        raise DDTError(f"length must be an integer in 1..{MAX_MEMORY_BYTES}: {length!r}")
+    if offset + length > 0x10000:
+        raise DDTError(f"the observed region {offset:#x}..{offset + length:#x} crosses a 64 KiB "
+                       f"segment boundary")
+    requested = f"{_hex16(segment)}:{_hex16(offset)}"
+    commands: list[dict] = []
+    rid = 0
+    initial = post = final = None
+    before = after = before_response = after_response = step_response = reported = None
+    step_sent = False
+
+    def next_rid() -> int:
+        nonlocal rid
+        rid += 1
+        return rid
+
+    def ask(conn: socket.socket, command: str) -> dict:
+        response = _request(conn, next_rid(), command, command_timeout)
+        commands.append(response)
+        return response
+
+    def observe(conn: socket.socket, label: str) -> dict:
+        response = ask(conn, "EXEC EV " + " ".join(REGISTERS))
+        registers = _parse_registers(response["raw"]) if response["status"] == "OK" else None
+        if registers is None:
+            raise DDTError(f"{label}: could not read the CPU registers: {response['raw']}")
+        return {"registers": registers, "cs_ip": f"{registers['CS']}:{registers['IP']}"}
+
+    def read_region(conn: socket.socket, label: str) -> tuple[dict, dict]:
+        response = ask(conn, f"EXEC MEMREAD {requested} {_hex16(length)}")
+        if response["status"] != "OK":
+            raise DDTError(f"{label}: the debugger refused the memory read: {response['raw']}")
+        parsed = _parse_memread_line(response["raw"], _hex16(segment), _hex16(offset), length)
+        return parsed, response
+
+    with _accepted_connection(port, timeout) as conn:
+        ping = ask(conn, "PING")
+        if ping["status"] != "OK" or ping["raw"] != ["PONG"]:
+            raise DDTError("DOSBox-X debugger did not answer PING with PONG")
+        if settle > 0:
+            time.sleep(settle)
+        help_response = ask(conn, "EXEC HELP")
+        if help_response["status"] != "OK":
+            raise DDTError("could not read the debugger command list (EXEC HELP was refused: "
+                           f"{help_response['raw']})")
+        mem_ok = _advertises(help_response["raw"], "MEMREAD")
+        step_ok = _advertises(help_response["raw"], "STEPIN")
+        capability = {"checked_with": "EXEC HELP", "memread_advertised": mem_ok,
+                      "stepin_advertised": step_ok,
+                      "evidence": [line.strip() for line in help_response["raw"]
+                                   if line.strip().split(None, 1)[:1] in (["MEMREAD"], ["STEPIN"])]}
+        if not (mem_ok and step_ok):
+            missing = " and ".join(name for name, ok in (("MEMREAD", mem_ok), ("STEPIN", step_ok))
+                                   if not ok)
+            raise DDTError(f"Connected DOSBox-X debugger does not advertise {missing}; this command "
+                           f"needs a debugger-enabled build with both bounded memory observation and "
+                           f"external stepping support.")
+        initial = observe(conn, "before the initial memory read")
+        before, before_response = read_region(conn, "the initial memory read")
+        settled = observe(conn, "after the initial memory read")
+        if settled["cs_ip"] != initial["cs_ip"]:
+            raise DDTError(f"CS:IP moved during the initial memory read ({initial['cs_ip']} -> "
+                           f"{settled['cs_ip']}); no instruction was executed")
+        # From here the guest instruction may execute; never retry, undo or resume.
+        try:
+            step_sent = True
+            step_response = ask(conn, "EXEC STEPIN")
+            if step_response["status"] != "OK":
+                raise DDTError(f"the debugger refused STEPIN: {step_response['raw']}")
+            reported = _parse_step_line(step_response["raw"])
+            if reported is None:
+                raise DDTError(f"the STEPIN response did not report the resulting CS:IP/registers "
+                               f"({step_response['raw']!r})")
+            post = observe(conn, "after the step")
+            if (reported["cs"] != post["registers"]["CS"] or reported["ip"] != post["registers"]["IP"]
+                    or reported["AX"] != post["registers"]["AX"]
+                    or reported["BX"] != post["registers"]["BX"]):
+                raise DDTError(f"the STEPIN response and the register read disagree "
+                               f"(STEPIN CS:IP={reported['cs_ip']} AX={reported['AX']} BX={reported['BX']}; "
+                               f"EV CS:IP={post['cs_ip']} AX={post['registers']['AX']} "
+                               f"BX={post['registers']['BX']})")
+            after, after_response = read_region(conn, "the post-step memory read")
+            final = observe(conn, "after the post-step memory read")
+            if final["cs_ip"] != post["cs_ip"]:
+                raise DDTError(f"CS:IP moved during the post-step memory read ({post['cs_ip']} -> "
+                               f"{final['cs_ip']})")
+        except DDTError as exc:
+            if step_sent:
+                raise DDTError(f"{exc} - the guest instruction may already have executed; DDT does "
+                               f"not retry, undo, or resume it") from exc
+            raise
+
+    byte_differences = []
+    for index in range(length):
+        pair = (before["hex"][index * 2:index * 2 + 2], after["hex"][index * 2:index * 2 + 2])
+        if pair[0] != pair[1]:
+            byte_differences.append({"relative_offset": index,
+                                     "address": f"{_hex16(segment)}:{_hex16(offset + index)}",
+                                     "before": pair[0], "after": pair[1]})
+    unknown = ["whether guest memory outside the selected region changed",
+               "whether the emulator is paused or running (no stopped-state query exists)"]
+    if not dosbox_version:
+        unknown.append("DOSBox-X build identity (not queried over the protocol)")
+    record = {
+        "schema": STEP_MEMORY_SCHEMA,
+        "endpoint": {"host": "127.0.0.1", "port": port},
+        "protocol": PROTOCOL,
+        "dosbox_version": dosbox_version,
+        "capability": capability,
+        "request": {"segment": _hex16(segment), "offset": _hex16(offset), "length": length,
+                    "cs_ip": requested,
+                    "read_command": f"EXEC MEMREAD {requested} {_hex16(length)}"},
+        "initial": initial,
+        "memory_before": {"address": f"{before['segment']}:{before['offset']}",
+                          "length": before["length"], "bytes_hex": before["hex"],
+                          "raw": before_response["raw"]},
+        "step": {"command": step_response["request"], "response": step_response["raw"],
+                 "reported": reported},
+        "after_step": post,
+        "memory_after": {"address": f"{after['segment']}:{after['offset']}",
+                         "length": after["length"], "bytes_hex": after["hex"],
+                         "raw": after_response["raw"]},
+        "final": final,
+        "register_differences": _differences(initial["registers"], post["registers"]),
+        "byte_differences": byte_differences,
+        "changed_byte_count": len(byte_differences),
+        "checks": {"cs_ip_unchanged_during_initial_read": True,
+                   "cs_ip_unchanged_during_post_step_read": True,
+                   "step_report_matches_registers": True,
+                   "execution_left_stopped": True},
+        "commands": commands,
+        "unknown": unknown,
+        "limits": list(_STEP_MEMORY_LIMITS),
     }
     if out is not None:
         _write_json(Path(out), record)

@@ -11,7 +11,8 @@ from .capture import intake
 from .code import callees, callers, readers, writers
 from .correlate import correlate
 from .diff import compare, manifest
-from .dosbox import capture_breakpoint, capture_cpu, capture_memory, capture_steps
+from .dosbox import (capture_breakpoint, capture_cpu, capture_memory, capture_step_memory,
+                     capture_steps)
 from .errors import DDTError
 from .format import inspect, map_address
 from .ghidra import export_function
@@ -119,6 +120,17 @@ def main(argv: list[str] | None = None) -> int:
     cm.add_argument("--timeout", type=float, default=60.0, help="Seconds to wait for the connection")
     cm.add_argument("--dosbox-version", default=None, help="Record an operator-known DOSBox-X version")
     cm.add_argument("--json", action="store_true")
+    csm = dbg_sub.add_parser("capture-step-memory",
+                             help="Observe one memory region across exactly one instruction")
+    csm.add_argument("--port", type=int, default=58991, help="Loopback port DOSBox-X connects back to")
+    csm.add_argument("--segment", required=True, type=_num, help="Real-mode segment of the region")
+    csm.add_argument("--offset", required=True, type=_num, help="Real-mode offset of the region")
+    csm.add_argument("--length", required=True, type=int, help="Bytes to observe (1..256)")
+    csm.add_argument("--out", type=Path, default=None, help="Write the observation JSON here")
+    csm.add_argument("--settle", type=float, default=3.0, help="Seconds to wait after connect")
+    csm.add_argument("--timeout", type=float, default=60.0, help="Seconds to wait for the connection")
+    csm.add_argument("--dosbox-version", default=None, help="Record an operator-known DOSBox-X version")
+    csm.add_argument("--json", action="store_true")
     mem = commands.add_parser("memory", help="Compare observed guest memory with static evidence")
     mem_sub = mem.add_subparsers(dest="memory_command", required=True)
     mc = mem_sub.add_parser("compare", help="Compare original, Ghidra and runtime instruction bytes")
@@ -182,6 +194,11 @@ def main(argv: list[str] | None = None) -> int:
                 output = capture_memory(args.port, segment=args.segment, offset=args.offset,
                                         length=args.length, settle=args.settle, timeout=args.timeout,
                                         dosbox_version=args.dosbox_version, out=args.out)
+            elif args.debugger_command == "capture-step-memory":
+                output = capture_step_memory(args.port, segment=args.segment, offset=args.offset,
+                                             length=args.length, settle=args.settle,
+                                             timeout=args.timeout,
+                                             dosbox_version=args.dosbox_version, out=args.out)
             else:
                 output = capture_steps(args.port, count=args.count, settle=args.settle,
                                        timeout=args.timeout, dosbox_version=args.dosbox_version,

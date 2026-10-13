@@ -26,6 +26,7 @@ A small, read-only, cross-platform toolkit for examining 16-bit DOS executables.
 - Optional DOSBox-X execution-breakpoint capture at an explicit runtime address
 - Optional DOSBox-X single-instruction stepping (only on builds advertising `STEPIN`)
 - Optional DOSBox-X bounded conventional-RAM observation (only on builds advertising `MEMREAD`)
+- Optional DOSBox-X single-instruction memory-change observation (needs both `MEMREAD` and `STEPIN`)
 - Offline comparison of observed runtime bytes with original and Ghidra instruction bytes
 - Versioned JSON output and a nonzero exit code on invalid input
 - Native Linux and Windows packaging workflow using native runners
@@ -52,6 +53,7 @@ ddt debugger capture-cpu --port 58991 --out cpu.json --json
 ddt debugger capture-breakpoint --port 58991 --segment 0x0813 --offset 0x0103 --out bp.json --json
 ddt debugger capture-steps --port 58991 --count 2 --out steps.json --json
 ddt debugger capture-memory --port 58991 --segment 0x0813 --offset 0x0103 --length 3 --out memory.json --json
+ddt debugger capture-step-memory --port 58991 --segment 0x0813 --offset 0x0200 --length 16 --out step-memory.json --json
 ddt memory compare --correlation correlation.json --observation memory.json --binary PROGRAM.COM --json
 ddt ghidra export --project ./proj --program GAME.EXE --function 1000:0000 --out func.json --json
 ddt code callers --export func.json --json
@@ -119,6 +121,10 @@ Captured values are DOSBox-X runtime observations, not Ghidra addresses, module 
 `ddt debugger capture-memory --segment 0x0813 --offset 0x0103 --length 3` reads 1–256 bytes of **actual guest RAM** from an already-stopped debugger and reports `ddt.dosbox-memory.v1` (address, requested length, exact hex bytes, initial/final CS:IP, and the raw `MEMREAD` response). **`MEMREAD` is an optional, experimental DOSBox-X capability** — upstream DOSBox-X 2026.10.01 does not include it (the local patch is not upstream, unlike the STEPIN contribution). Support is detected from the non-executing `EXEC HELP` output; an unreadable byte fails the whole request rather than becoming a fabricated zero. Only real-mode conventional RAM below `A0000h` is read, in a single bounded request, and DDT never issues `BREAK`/`RUN`/`STEPIN` or writes memory.
 
 `ddt memory compare --correlation correlation.json --observation memory.json --binary PROGRAM.COM` compares three byte sources for one instruction: the **original executable**, **Ghidra's recorded memory bytes** (from the correlation's instruction), and the **DOSBox-X observed runtime bytes**. It requires the binary's SHA-256 to match the correlation, the observation to cover exactly the correlation's derived address and length (segment aliases are rejected, not treated as equivalent), and valid hex of the expected length; for MZ it also reports any relocation word overlapping the instruction extent. The result (`ddt.memory-comparison.v1`) reports `runtime_equals_original`, `runtime_equals_ghidra` and `ghidra_equals_original`, a bounded list of differing byte positions, and explicit uncertainty — **evidence, never an inferred cause** (relocations, loader activity or runtime modification can all explain a difference).
+
+`ddt debugger capture-step-memory --segment 0x0813 --offset 0x0200 --length 16` reads a bounded RAM region, executes **exactly one** DOS instruction, reads the identical region again and reports `ddt.dosbox-step-memory.v1`: the before/after bytes, each changed byte (`relative_offset`, `address`, `before`, `after`), the register differences, the synchronous STEPIN response and the raw exchanges. It needs a debugger-enabled build advertising **both** `MEMREAD` and `STEPIN` (the two experimental capabilities) and a debugger already stopped at the intended instruction — start the program with `DEBUGBOX`; DDT never launches the program, sets breakpoints or resumes execution. `--segment`/`--offset`/`--length` are the **region to observe**, an explicit runtime address rather than an instruction address: supply it from the observed registers (for a `DS`-relative instruction, use the observed `DS`), because DDT does not assume the region belongs to `CS`, `DS` or `SS`. Everything happens on one connection as a fixed sequence (capability check → registers → read → registers → one `STEPIN` → registers → read → registers) and execution is left stopped.
+
+The evidence rules are explicit in the record: a changed byte shows the observed RAM differed between the two reads, **not** that the stepped instruction was the only possible cause; zero changed bytes means no difference was seen *inside the selected region*, not that the instruction wrote nothing elsewhere; register observations cover only the registers DDT reads; and a stable CS:IP across the reads is a consistency check, not proof of the debugger's internal state. A failed read after the step is reported as *uncertain* — the guest instruction may already have executed, and DDT never retries, undoes or resumes it.
 
 ## Distribution builds
 
