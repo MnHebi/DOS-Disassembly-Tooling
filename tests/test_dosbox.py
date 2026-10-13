@@ -496,12 +496,15 @@ _FAKE_STATE = {"AX": "0000", "BX": "0000", "CX": "00FF", "DX": "0813", "SI": "01
 class _FakeStepDOSBox(threading.Thread):
     def __init__(self, port, *, advertise=True, refuse_stepin=None, malformed=False,
                  fail_at_step=None, drop_on=None, refuse_run=False,
+                 ev_mismatch=False,
                  script=({"AX": "1234", "IP": "0103"}, {"BX": "5678", "IP": "0106"})):
         super().__init__(daemon=True)
         self.port, self.advertise, self.refuse_stepin = port, advertise, refuse_stepin
         self.malformed, self.fail_at_step, self.drop_on = malformed, fail_at_step, drop_on
         self.refuse_run, self.script = refuse_run, list(script)
         self.state = dict(_FAKE_STATE)
+        self.ev_mismatch = ev_mismatch
+        self.ev_state = dict(self.state)
         self.step_index, self.seen = 0, []
 
     def run(self):
@@ -548,7 +551,7 @@ class _FakeStepDOSBox(threading.Thread):
             return "OK", lines
         if command.startswith("EXEC EV "):
             names = command.split()[2:]
-            return "OK", [f"EV of '{' '.join(names)}' is:", " ".join(self.state[n] for n in names)]
+            return "OK", [f"EV of '{' '.join(names)}' is:", " ".join(self.ev_state[n] for n in names)]
         if command == "EXEC STEPIN":
             self.step_index += 1
             if self.fail_at_step == self.step_index:
@@ -558,6 +561,8 @@ class _FakeStepDOSBox(threading.Thread):
             if self.malformed:
                 return "OK", ["DEBUG: STEPIN executed"]
             self.state.update(self.script[min(self.step_index - 1, len(self.script) - 1)])
+            if not self.ev_mismatch:
+                self.ev_state.update(self.state)
             return "OK", [f"DEBUG: STEPIN CS:IP={self.state['CS']}:{self.state['IP']} "
                           f"AX={self.state['AX']} BX={self.state['BX']} "
                           f"CX={self.state['CX']} DX={self.state['DX']}"]
@@ -691,3 +696,24 @@ def test_cli_capture_steps(tmp_path):
     assert payload["schema"] == "ddt.dosbox-steps.v1"
     assert payload["completed_count"] == 2 and payload["final"]["cs_ip"] == "0813:0106"
     peer.join(timeout=5)
+
+
+def test_conflicting_step_observations_are_rejected(tmp_path):
+    port = _free_port()
+    out = tmp_path / "steps.json"
+    out.write_text("KEEP", encoding="utf-8")
+    record, error, peer = _capture_steps(port, _FakeStepDOSBox(port, ev_mismatch=True),
+                                         count=2, out=out)
+    assert record is None
+    text = str(error)
+    assert "step 1" in text and "disagree" in text
+    assert "STEPIN CS:IP=0813:0103" in text and "EV CS:IP=0813:0100" in text
+    assert len([c for c in peer.seen if c == "EXEC STEPIN"]) == 1  # no further instruction
+    assert out.read_text(encoding="utf-8") == "KEEP"               # existing record preserved
+
+
+def test_matching_step_observations_are_accepted():
+    port = _free_port()
+    record, error, _ = _capture_steps(port, _FakeStepDOSBox(port), count=2)
+    assert error is None
+    assert all(s["reported"]["cs_ip"] == s["cs_ip"] for s in record["steps"])

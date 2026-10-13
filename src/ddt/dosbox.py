@@ -42,13 +42,19 @@ _LIMITS = [
     "The DOSBox-X build identity is not obtainable over this protocol; pass "
     "--dosbox-version to record it",
     "The listener accepts one loopback client and one pending command at a time",
-    "These values are static-analysis-free observations made at the moment of the break",
+]
+
+_RESUME_LIMITS = [
     "An accepted RUN is an acknowledgement, not proof that emulation actually resumed",
     "DDT cannot tell whether the debugger was already paused before BREAK; --leave-paused "
     "avoids resuming a user's own paused session",
 ]
 
-_BREAKPOINT_LIMITS = _LIMITS + [
+_CPU_LIMITS = _LIMITS + [
+    "These values are static-analysis-free observations made at the moment of the BREAK",
+] + _RESUME_LIMITS
+
+_BREAKPOINT_LIMITS = _LIMITS + _RESUME_LIMITS + [
     "DOSBox-X exposes no asynchronous breakpoint-hit event: the control channel only has "
     "PING, BREAK and EXEC, and ControlServer_SendEvent is never called",
     "target_ip_observed_stable only means repeated CS:IP observations matched the requested "
@@ -324,7 +330,7 @@ def capture_cpu(port: int = DEFAULT_PORT, *, settle: float = 3.0, timeout: float
                      "CPU status from EXEC CPU"]
                     + ([] if leave_paused else ["resume requested (RUN acknowledgement recorded)"]),
         "unknown": unknown,
-        "limits": list(_LIMITS),
+        "limits": list(_CPU_LIMITS),
     }
     if out is not None:
         _write_json(Path(out), record)
@@ -397,6 +403,14 @@ def capture_steps(port: int = DEFAULT_PORT, *, count: int = DEFAULT_STEPS, settl
             if after is None:
                 raise DDTError(f"step {index}: the post-step register read was refused: "
                                f"{after_response['raw']}")
+            # The synchronous STEPIN report and the register read must agree on the
+            # overlapping values; both are normalized to fixed-width hex already.
+            if (reported["cs"] != after["CS"] or reported["ip"] != after["IP"]
+                    or reported["AX"] != after["AX"] or reported["BX"] != after["BX"]):
+                raise DDTError(
+                    f"step {index}: the STEPIN response and the register read disagree "
+                    f"(STEPIN CS:IP={reported['cs_ip']} AX={reported['AX']} BX={reported['BX']}; "
+                    f"EV CS:IP={after['CS']}:{after['IP']} AX={after['AX']} BX={after['BX']})")
             steps.append({"index": index, "request": step_response["request"],
                           "status": step_response["status"], "raw": step_response["raw"],
                           "reported": reported, "registers": after,
