@@ -9,6 +9,7 @@ import sys
 from . import __version__
 from .capture import intake
 from .code import callees, callers, readers, writers
+from .correlate import correlate
 from .diff import compare, manifest
 from .dosbox import capture_breakpoint, capture_cpu, capture_steps
 from .errors import DDTError
@@ -53,6 +54,15 @@ def main(argv: list[str] | None = None) -> int:
     idn.add_argument("path", type=Path)
     idn.add_argument("--format", choices=["auto", "mz", "com"], default="auto")
     idn.add_argument("--json", action="store_true")
+    cor = commands.add_parser("correlate",
+                              help="Derive a candidate runtime address for an exported instruction")
+    cor.add_argument("--binary", required=True, type=Path, help="Original COM or MZ executable")
+    cor.add_argument("--format", required=True, choices=["com", "mz"])
+    cor.add_argument("--export", required=True, type=Path, help="ddt.ghidra-function.v1 JSON")
+    cor.add_argument("--instruction", required=True, help="Ghidra instruction address from the export")
+    cor.add_argument("--entry-observation", required=True, type=Path,
+                     help="ddt.dosbox-steps.v1 record made at the program entry")
+    cor.add_argument("--json", action="store_true")
     cap = commands.add_parser("capture", help="Read-only intake of paired artifact captures")
     cap_sub = cap.add_subparsers(dest="capture_command", required=True)
     ci = cap_sub.add_parser("intake", help="Compare a before/after capture and record a receipt")
@@ -133,6 +143,9 @@ def main(argv: list[str] | None = None) -> int:
             output = extract(args.path, args.min_length, args.max_results)
         elif args.command == "identify":
             output = identify(args.path, args.format)
+        elif args.command == "correlate":
+            output = correlate(args.binary, args.format, args.export, args.instruction,
+                               args.entry_observation)
         elif args.command == "capture":
             output = intake(args.before, args.after, out=args.out, note=args.note,
                             max_runs=args.max_runs)

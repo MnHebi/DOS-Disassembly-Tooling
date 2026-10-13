@@ -17,6 +17,7 @@ A small, read-only, cross-platform toolkit for examining 16-bit DOS executables.
 - File and directory SHA-256 manifests
 - Binary file and directory comparison with exact differing spans, bounded hexadecimal previews and exact run counts
 - Printable-string extraction with exact original file offsets
+- Static/runtime address correlation from original file offsets and an observed entry context
 - Read-only export of one analyzed function from an existing Ghidra project (optional; Ghidra is not needed for any other command)
 - Offline navigation over an exported function: direct callers/callees and memory readers/writers (no Ghidra required)
 - Read-only identification of DOS containers, embedded signatures and packaging markers
@@ -44,6 +45,7 @@ ddt manifest before/ --json
 ddt strings GAME.EXE --json
 ddt identify PROGRAM.EXE --json
 ddt capture intake --before ./capture-before --after ./capture-after --json
+ddt correlate --binary PROGRAM.EXE --format mz --export func.json --instruction 1000:000c --entry-observation steps.json --json
 ddt debugger capture-cpu --port 58991 --out cpu.json --json
 ddt debugger capture-breakpoint --port 58991 --segment 0x0813 --offset 0x0103 --out bp.json --json
 ddt debugger capture-steps --port 58991 --count 2 --out steps.json --json
@@ -91,6 +93,12 @@ Each finding carries a `classification` of `identified`, `candidate` or `unknown
 Intended workflow: (1) prepare an isolated DOS application environment and pick one action to investigate; (2) have the operator take a BEFORE snapshot using the application's normal controls; (3) perform the single action; (4) take an AFTER snapshot; (5) run `ddt capture intake`; (6) keep the original artifacts and the receipt.
 
 A receipt states what DDT read and what differs — it does not prove which application, executable or runtime session produced the captures, and it does not attribute any difference to the action. DDT does not drive the emulator or simulate input.
+
+## Static/runtime address correlation
+
+`ddt correlate --binary PROGRAM.EXE --format mz --export func.json --instruction 1000:000c --entry-observation steps.json` derives a **candidate** real-mode runtime address for one instruction in a Ghidra export (`ddt.address-correlation.v1`), chaining three pieces of evidence: the original executable bytes (the export's `executable_sha256` must equal the binary's SHA-256), the instruction's original source-file offset from the `ddt.ghidra-function.v1` export, and an observed entry context from a `ddt.dosbox-steps.v1` record made at the program entry (`DEBUGBOX`). For COM it requires the observed entry IP to be `0100` and maps file offset `F` to runtime `entryCS:0100+F`; for MZ it requires the observed IP to equal the header's entry IP, derives `load_segment = entryCS − header_entry_CS`, `module_offset = F − header_bytes`, and reports the canonical `segment:offset` for the resulting physical address, rejecting any value that would need wrap/A20 assumptions.
+
+The result is **conditional**, never verified execution: no guest memory is read, so byte equality at the derived address is not observed, and Ghidra's address space is never equated with the guest's `segment:offset` space. It is not applicable to overlays, protected-mode extenders, uninitialized storage without a file offset, or self-modified/decompressed code, and the canonical `segment:offset` is one representation, not necessarily the alias the running program uses. (Known prerequisite gap: the current export workflow cannot produce a COM function export, because Ghidra's raw-binary loader gives a headerless COM no function entry point; the MZ path is verified end-to-end.)
 
 ## DOSBox-X debugger capture (optional)
 
