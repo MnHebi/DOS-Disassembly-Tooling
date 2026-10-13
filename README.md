@@ -22,6 +22,7 @@ A small, read-only, cross-platform toolkit for examining 16-bit DOS executables.
 - Read-only identification of DOS containers, embedded signatures and packaging markers
 - Read-only runtime capture intake: compare an operator's before/after artifact snapshots
 - Optional DOSBox-X debugger CPU-state capture (needs a debugger-enabled DOSBox-X build)
+- Optional DOSBox-X execution-breakpoint capture at an explicit runtime address
 - Versioned JSON output and a nonzero exit code on invalid input
 - Native Linux and Windows packaging workflow using native runners
 
@@ -43,6 +44,7 @@ ddt strings GAME.EXE --json
 ddt identify PROGRAM.EXE --json
 ddt capture intake --before ./capture-before --after ./capture-after --json
 ddt debugger capture-cpu --port 58991 --out cpu.json --json
+ddt debugger capture-breakpoint --port 58991 --segment 0x0813 --offset 0x0103 --out bp.json --json
 ddt ghidra export --project ./proj --program GAME.EXE --function 1000:0000 --out func.json --json
 ddt code callers --export func.json --json
 ddt code callees --export func.json --json
@@ -95,6 +97,8 @@ A receipt states what DDT read and what differs — it does not prove which appl
 This needs a DOSBox-X built with the internal debugger **and** SDL_net (`./configure --enable-debug --enable-sdl2`, with SDL2_net installed). The standard distributions, including the common Flatpak build, ship with the debugger disabled; keep that installation and build a separate debugger-enabled DOSBox-X (for example inside a container). Instruction-level checks (break, registers, memory) require launching DOSBox-X from a terminal, because the text debugger initialises only with a TTY.
 
 Captured values are DOSBox-X runtime observations, not Ghidra addresses, module offsets or original file offsets, and DDT never translates between them. The DOSBox-X build identity is not obtainable over the protocol, so pass `--dosbox-version` to record one. The debugger's `MEMDUMPBIN` memory dump was independently verified to work, but it is not exposed by DDT yet because its output is written into the emulated DOS drive rather than a DDT-controlled location.
+
+`ddt debugger capture-breakpoint --segment 0x0813 --offset 0x0103` installs one real-mode execution breakpoint at an explicit runtime `segment:offset` (no automatic translation from any other address space), confirms it through `BPLIST`, resumes, and reports `ddt.dosbox-breakpoint.v1`. DOSBox-X exposes **no asynchronous breakpoint-hit event** — the control channel only has `PING`, `BREAK` and `EXEC`, and its event sender is never called — so a hit is reported only when CS:IP is observed pinned to the requested address across several differently spaced register queries after resuming, without issuing another `BREAK`. That is observed execution evidence, not a protocol notification: a tight self-loop exactly at the target could mimic a stop, so the record carries the raw exchanges and states the limitation. The response also records the registers at the stop, whether the breakpoint DDT installed was removed (unrelated user breakpoints are left untouched), and whether the emulator resumed; `--leave-paused` keeps it stopped.
 
 ## Distribution builds
 

@@ -240,3 +240,162 @@ def test_leave_paused_skips_resume():
     assert error is None
     assert record["left_paused"] is True and record["resumed"] is False
     assert not any(command.startswith("EXEC RUN") for command in peer.seen)
+
+
+# --- Stage 2: breakpoint capture --------------------------------------------
+
+class _FakeBreakpointDOSBox(threading.Thread):
+    def __init__(self, port, *, install_state="0813:0100", stop_state="0813:0103",
+                 pre_existing=(), ignore_install=False):
+        super().__init__(daemon=True)
+        self.port, self.install_state, self.stop_state = port, install_state, stop_state
+        self.bps = {}
+        for index, entry in enumerate(pre_existing):
+            self.bps[f"{index:02d}"] = entry
+        self.ignore_install, self.seen, self.cs_ip_calls = ignore_install, [], 0
+
+    def run(self):
+        deadline = time.time() + 3.0
+        while True:
+            try:
+                conn = socket.create_connection(("127.0.0.1", self.port), timeout=2); break
+            except OSError:
+                if time.time() > deadline:
+                    return
+                time.sleep(0.05)
+        conn.settimeout(5)
+        buffer = b""
+        try:
+            while True:
+                try:
+                    data = conn.recv(4096)
+                except socket.timeout:
+                    return
+                if not data:
+                    return
+                buffer += data
+                while b"\n" in buffer:
+                    raw, buffer = buffer.split(b"\n", 1)
+                    parts = raw.decode().split(" ", 2)
+                    rid, command = parts[1], parts[2]
+                    self.seen.append(command)
+                    status, lines = self._reply(command)
+                    conn.sendall(("\n".join([f"BEGIN {rid} {status}", *lines, f"END {rid}"]) + "\n").encode())
+        finally:
+            conn.close()
+
+    def _reply(self, command):
+        if command == "PING":
+            return "OK", ["PONG"]
+        if command == "BREAK":
+            return "OK", ["***| TYPE HELP |***"]
+        if command.startswith("EXEC BP "):
+            if not self.ignore_install:
+                number = f"{len(self.bps):02d}"
+                self.bps[number] = f"{number}. BP {command.split()[2]}"
+            return "OK", ["DEBUG: Set breakpoint"]
+        if command == "EXEC BPLIST":
+            return "OK", ["Breakpoint list:", "-" * 10, *self.bps.values()]
+        if command.startswith("EXEC BPDEL "):
+            self.bps.pop(command.split()[2], None)
+            return "OK", ["DEBUG: Breakpoint deletion success."]
+        if command == "EXEC RUN":
+            return "OK", ["OK"]
+        if command == "EXEC EV CS IP":
+            self.cs_ip_calls += 1
+            state = self.install_state if self.cs_ip_calls == 1 else self.stop_state
+            return "OK", ["EV of 'CS IP' is:", state.replace(":", " ")]
+        if command.startswith("EXEC EV AX"):
+            return "OK", ["EV of 'AX ...' is:",
+                          "1234 5678 0000 0000 0000 0000 0000 0000 0813 0103 0813 0813 0813"]
+        return "ERR", ["*** Debugger command not recognized"]
+
+
+def _capture_bp(port, **kwargs):
+    result, errors = {}, {}
+    peer = kwargs.pop("peer") if "peer" in kwargs else _FakeBreakpointDOSBox(port)
+
+    def target():
+        try:
+            result["record"] = dosbox.capture_breakpoint(port, segment=0x0813, offset=0x0103,
+                                                          settle=0.0, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - captured for assertion
+            errors["error"] = exc
+
+    worker = threading.Thread(target=target)
+    worker.start()
+    peer.start()
+    worker.join(timeout=20)
+    peer.join(timeout=5)
+    return result.get("record"), errors.get("error"), peer
+
+
+def test_breakpoint_hit_is_confirmed_and_cleaned_up():
+    port = _free_port()
+    record, error, peer = _capture_bp(port, confirm=3)
+    assert error is None
+    assert record["schema"] == "ddt.dosbox-breakpoint.v1"
+    assert record["requested"]["cs_ip"] == "0813:0103"
+    assert record["hit_confirmed"] is True
+    assert record["observed_stop_cs_ip"] == "0813:0103"
+    assert record["confirmation_polls"] == ["0813:0103"] * 3
+    assert record["breakpoint"]["number"] == "00"
+    assert record["cleanup"]["deleted"] is True and record["cleanup"]["list_after_delete"] == []
+    assert record["resumed"] is True and record["left_paused"] is False
+    assert record["registers"]["AX"] == "1234"
+    assert record["install_time_cs_ip"] == "0813:0100"
+    assert any("no asynchronous breakpoint-hit event" in limit for limit in record["limits"])
+
+
+def test_unrelated_user_breakpoint_is_preserved():
+    port = _free_port()
+    peer = _FakeBreakpointDOSBox(port, pre_existing=["00. BP 0813:0200"])
+    record, error, _ = _capture_bp(port, peer=peer, confirm=2)
+    assert error is None
+    assert record["breakpoint"]["number"] == "01"
+    assert record["cleanup"]["list_after_delete"] == ["00. BP 0813:0200"]
+    assert record["cleanup"]["deleted"] is True
+
+
+def test_missing_hit_is_reported_and_cleaned_up():
+    port = _free_port()
+    peer = _FakeBreakpointDOSBox(port, stop_state="0813:0106")
+    record, error, _ = _capture_bp(port, peer=peer, confirm=2)
+    assert record is None
+    assert "was not observed to stop" in str(error)
+    assert peer.bps == {}  # DDT removed only its own breakpoint
+    assert any(command.startswith("EXEC RUN") for command in peer.seen)
+
+
+def test_ambiguous_install_is_rejected_and_not_deleted():
+    port = _free_port()
+    peer = _FakeBreakpointDOSBox(port, ignore_install=True, pre_existing=["00. BP 0813:0200"])
+    record, error, _ = _capture_bp(port, peer=peer, confirm=2)
+    assert record is None
+    assert "could not identify exactly one new breakpoint" in str(error)
+    assert not any(command.startswith("EXEC BPDEL") for command in peer.seen)
+    assert peer.bps == {"00": "00. BP 0813:0200"}
+
+
+def test_breakpoint_validation_and_leave_paused():
+    with pytest.raises(DDTError, match="segment and offset"):
+        dosbox.capture_breakpoint(1, segment=0x10000, offset=0)
+    port = _free_port()
+    record, error, peer = _capture_bp(port, confirm=2, leave_paused=True)
+    assert error is None
+    assert record["left_paused"] is True and record["resumed"] is False
+
+
+def test_cli_capture_breakpoint(tmp_path):
+    port = _free_port()
+    peer = _FakeBreakpointDOSBox(port)
+    peer.start()
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run([sys.executable, "-m", "ddt", "debugger", "capture-breakpoint",
+                           "--port", str(port), "--segment", "0x0813", "--offset", "0x0103",
+                           "--settle", "0", "--timeout", "10", "--confirm", "2", "--json"],
+                          check=True, capture_output=True, text=True, env=env)
+    payload = json.loads(proc.stdout)
+    assert payload["hit_confirmed"] is True and payload["observed_stop_cs_ip"] == "0813:0103"
+    peer.join(timeout=5)

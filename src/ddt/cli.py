@@ -10,7 +10,7 @@ from . import __version__
 from .capture import intake
 from .code import callees, callers, readers, writers
 from .diff import compare, manifest
-from .dosbox import capture_cpu
+from .dosbox import capture_breakpoint, capture_cpu
 from .errors import DDTError
 from .format import inspect, map_address
 from .ghidra import export_function
@@ -73,6 +73,19 @@ def main(argv: list[str] | None = None) -> int:
     dc.add_argument("--leave-paused", action="store_true",
                     help="Leave the debugger paused instead of resuming the emulator")
     dc.add_argument("--json", action="store_true")
+    cb = dbg_sub.add_parser("capture-breakpoint",
+                            help="Install one real-mode breakpoint and capture the stop")
+    cb.add_argument("--port", type=int, default=58991, help="Loopback port DOSBox-X connects back to")
+    cb.add_argument("--segment", required=True, type=_num, help="Real-mode segment (e.g. 0x0813)")
+    cb.add_argument("--offset", required=True, type=_num, help="Real-mode offset (e.g. 0x0103)")
+    cb.add_argument("--out", type=Path, default=None, help="Write the observation JSON here")
+    cb.add_argument("--settle", type=float, default=3.0, help="Seconds to wait after connect")
+    cb.add_argument("--timeout", type=float, default=60.0, help="Seconds to wait for the connection")
+    cb.add_argument("--confirm", type=int, default=4, help="Register polls that must agree on the stop")
+    cb.add_argument("--dosbox-version", default=None, help="Record an operator-known DOSBox-X version")
+    cb.add_argument("--leave-paused", action="store_true",
+                    help="Leave the debugger paused instead of resuming the emulator")
+    cb.add_argument("--json", action="store_true")
     gh = commands.add_parser("ghidra", help="Optional read-only Ghidra integration")
     gh_sub = gh.add_subparsers(dest="ghidra_command", required=True)
     gx = gh_sub.add_parser("export", help="Export one analyzed function from an existing Ghidra project")
@@ -113,9 +126,15 @@ def main(argv: list[str] | None = None) -> int:
             output = intake(args.before, args.after, out=args.out, note=args.note,
                             max_runs=args.max_runs)
         elif args.command == "debugger":
-            output = capture_cpu(args.port, settle=args.settle, timeout=args.timeout,
-                                 dosbox_version=args.dosbox_version, out=args.out,
-                                 leave_paused=args.leave_paused)
+            if args.debugger_command == "capture-cpu":
+                output = capture_cpu(args.port, settle=args.settle, timeout=args.timeout,
+                                     dosbox_version=args.dosbox_version, out=args.out,
+                                     leave_paused=args.leave_paused)
+            else:
+                output = capture_breakpoint(args.port, segment=args.segment, offset=args.offset,
+                                            settle=args.settle, timeout=args.timeout,
+                                            confirm=args.confirm, dosbox_version=args.dosbox_version,
+                                            out=args.out, leave_paused=args.leave_paused)
         elif args.command == "ghidra":
             output = export_function(args.project, args.program, args.function, args.out,
                                      ghidra=args.ghidra, java_home=args.java_home, timeout=args.timeout)
