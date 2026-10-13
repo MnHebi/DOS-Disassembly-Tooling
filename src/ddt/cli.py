@@ -10,6 +10,7 @@ from . import __version__
 from .capture import intake
 from .code import callees, callers, readers, writers
 from .diff import compare, manifest
+from .dosbox import capture_cpu
 from .errors import DDTError
 from .format import inspect, map_address
 from .ghidra import export_function
@@ -61,6 +62,15 @@ def main(argv: list[str] | None = None) -> int:
     ci.add_argument("--note", default=None, help="Operator-supplied note (user metadata, not evidence)")
     ci.add_argument("--max-runs", type=int, default=128)
     ci.add_argument("--json", action="store_true")
+    dbg = commands.add_parser("debugger", help="Observe CPU state from a DOSBox-X debugger session")
+    dbg_sub = dbg.add_subparsers(dest="debugger_command", required=True)
+    dc = dbg_sub.add_parser("capture-cpu", help="Accept one DOSBox-X debugger connection and record CPU state")
+    dc.add_argument("--port", type=int, default=58991, help="Loopback port DOSBox-X connects back to")
+    dc.add_argument("--out", type=Path, default=None, help="Write the observation JSON here")
+    dc.add_argument("--settle", type=float, default=3.0, help="Seconds to wait after connect before BREAK")
+    dc.add_argument("--timeout", type=float, default=60.0, help="Seconds to wait for the connection")
+    dc.add_argument("--dosbox-version", default=None, help="Record an operator-known DOSBox-X version")
+    dc.add_argument("--json", action="store_true")
     gh = commands.add_parser("ghidra", help="Optional read-only Ghidra integration")
     gh_sub = gh.add_subparsers(dest="ghidra_command", required=True)
     gx = gh_sub.add_parser("export", help="Export one analyzed function from an existing Ghidra project")
@@ -100,6 +110,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "capture":
             output = intake(args.before, args.after, out=args.out, note=args.note,
                             max_runs=args.max_runs)
+        elif args.command == "debugger":
+            output = capture_cpu(args.port, settle=args.settle, timeout=args.timeout,
+                                 dosbox_version=args.dosbox_version, out=args.out)
         elif args.command == "ghidra":
             output = export_function(args.project, args.program, args.function, args.out,
                                      ghidra=args.ghidra, java_home=args.java_home, timeout=args.timeout)

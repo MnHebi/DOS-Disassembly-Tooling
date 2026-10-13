@@ -21,6 +21,7 @@ A small, read-only, cross-platform toolkit for examining 16-bit DOS executables.
 - Offline navigation over an exported function: direct callers/callees and memory readers/writers (no Ghidra required)
 - Read-only identification of DOS containers, embedded signatures and packaging markers
 - Read-only runtime capture intake: compare an operator's before/after artifact snapshots
+- Optional DOSBox-X debugger CPU-state capture (needs a debugger-enabled DOSBox-X build)
 - Versioned JSON output and a nonzero exit code on invalid input
 - Native Linux and Windows packaging workflow using native runners
 
@@ -41,6 +42,7 @@ ddt manifest before/ --json
 ddt strings GAME.EXE --json
 ddt identify PROGRAM.EXE --json
 ddt capture intake --before ./capture-before --after ./capture-after --json
+ddt debugger capture-cpu --port 58991 --out cpu.json --json
 ddt ghidra export --project ./proj --program GAME.EXE --function 1000:0000 --out func.json --json
 ddt code callers --export func.json --json
 ddt code callees --export func.json --json
@@ -85,6 +87,14 @@ Each finding carries a `classification` of `identified`, `candidate` or `unknown
 Intended workflow: (1) prepare an isolated DOS application environment and pick one action to investigate; (2) have the operator take a BEFORE snapshot using the application's normal controls; (3) perform the single action; (4) take an AFTER snapshot; (5) run `ddt capture intake`; (6) keep the original artifacts and the receipt.
 
 A receipt states what DDT read and what differs — it does not prove which application, executable or runtime session produced the captures, and it does not attribute any difference to the action. DDT does not drive the emulator or simulate input.
+
+## DOSBox-X debugger capture (optional)
+
+`ddt debugger capture-cpu --port 58991 --out cpu.json` listens on `127.0.0.1`, accepts the single connection that DOSBox-X makes when its `[dosbox] mcp_server=<port>` setting is enabled, and drives the documented line protocol (`REQ`/`BEGIN`/`END`): `PING`, `BREAK`, one `EV` register read, one `CPU` status read, then `RUN` to leave the emulator running. It writes a compact `ddt.dosbox-cpu.v1` observation containing the raw protocol exchanges and the parsed registers. Start the DDT command first so the listener exists before DOSBox-X connects; DDT does not launch or drive the emulator and exposes no other debugger command.
+
+This needs a DOSBox-X built with the internal debugger **and** SDL_net (`./configure --enable-debug --enable-sdl2`, with SDL2_net installed). The standard distributions, including the common Flatpak build, ship with the debugger disabled; keep that installation and build a separate debugger-enabled DOSBox-X (for example inside a container). Instruction-level checks (break, registers, memory) require launching DOSBox-X from a terminal, because the text debugger initialises only with a TTY.
+
+Captured values are DOSBox-X runtime observations, not Ghidra addresses, module offsets or original file offsets, and DDT never translates between them. The DOSBox-X build identity is not obtainable over the protocol, so pass `--dosbox-version` to record one. The debugger's `MEMDUMPBIN` memory dump was independently verified to work, but it is not exposed by DDT yet because its output is written into the emulated DOS drive rather than a DDT-controlled location.
 
 ## Distribution builds
 
