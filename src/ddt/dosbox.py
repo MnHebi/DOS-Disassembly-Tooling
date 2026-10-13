@@ -23,6 +23,7 @@ from .errors import DDTError
 SCHEMA = "ddt.dosbox-cpu.v1"
 BREAKPOINT_SCHEMA = "ddt.dosbox-breakpoint.v2"
 STEPS_SCHEMA = "ddt.dosbox-steps.v1"
+MEMORY_SCHEMA = "ddt.dosbox-memory.v1"
 PROTOCOL = "dosbox-x debugger control (line-oriented REQ/BEGIN/END)"
 DEFAULT_PORT = 58991
 DEFAULT_TIMEOUT = 60.0
@@ -31,6 +32,7 @@ DEFAULT_CONFIRM = 4
 DEFAULT_CONFIRM_WINDOW = 1.6
 DEFAULT_STEPS = 1
 MAX_STEPS = 64
+MAX_MEMORY_BYTES = 256
 MAX_RESPONSE_BYTES = 1 << 20
 MAX_RESPONSE_LINES = 4096
 REGISTERS = ("AX", "BX", "CX", "DX", "SI", "DI", "BP", "SP", "CS", "IP", "DS", "ES", "SS")
@@ -81,6 +83,18 @@ _STEPS_LIMITS = _LIMITS + [
 
 _STEP_LINE = re.compile(
     r"CS:IP=([0-9A-Fa-f]{1,4}):([0-9A-Fa-f]{1,4})\s+AX=([0-9A-Fa-f]{1,4})\s+BX=([0-9A-Fa-f]{1,4})")
+_MEMREAD_LINE = re.compile(
+    r"MEMREAD ([0-9A-Fa-f]{1,4}):([0-9A-Fa-f]{1,4}) LEN=([0-9A-Fa-f]{1,4}) HEX=([0-9A-Fa-f]+)")
+
+_MEMORY_LIMITS = _LIMITS + [
+    "The bytes are DOSBox-X's observation of conventional RAM at the moment of the read; they are "
+    "not Ghidra addresses, module offsets or original file offsets",
+    "Only real-mode conventional RAM below A0000h is read, and only while the debugger is stopped",
+    "MEMREAD is an experimental DOSBox-X capability published in an experimental patch; upstream "
+    "DOSBox-X 2026.10.01 does not provide it",
+    "A memory capture does not establish the identity of the executable that produced it",
+    "The read is read-only: no guest instruction is executed and the observed CS:IP is unchanged",
+]
 
 
 def _loopback(host: str) -> bool:
@@ -213,11 +227,11 @@ def _entry_address(entry: str) -> str | None:
         return None
 
 
-def _advertises_stepin(raw_lines: list[str]) -> bool:
-    """True only when the debugger HELP lists a STEPIN command entry."""
+def _advertises(raw_lines: list[str], name: str) -> bool:
+    """True only when the debugger HELP lists an entry for exactly this command."""
     for line in raw_lines:
         parts = line.strip().split(None, 1)
-        if len(parts) == 2 and parts[0] == "STEPIN" and "-" in parts[1]:
+        if len(parts) == 2 and parts[0] == name and "-" in parts[1]:
             return True
     return False
 
@@ -228,6 +242,16 @@ def _parse_step_line(raw_lines: list[str]) -> dict | None:
         if match:
             cs, ip, ax, bx = (f"{int(value, 16):04X}" for value in match.groups())
             return {"cs": cs, "ip": ip, "cs_ip": f"{cs}:{ip}", "AX": ax, "BX": bx}
+    return None
+
+
+def _parse_memread_line(raw_lines: list[str]) -> dict | None:
+    for line in raw_lines:
+        match = _MEMREAD_LINE.search(line)
+        if match:
+            segment, offset, length, hex_bytes = match.groups()
+            return {"segment": f"{int(segment, 16):04X}", "offset": f"{int(offset, 16):04X}",
+                    "length": int(length, 16), "hex": hex_bytes.upper()}
     return None
 
 
@@ -337,6 +361,107 @@ def capture_cpu(port: int = DEFAULT_PORT, *, settle: float = 3.0, timeout: float
     return record
 
 
+def capture_memory(port: int = DEFAULT_PORT, *, segment: int, offset: int, length: int,
+                   settle: float = 3.0, timeout: float = DEFAULT_TIMEOUT,
+                   command_timeout: float = DEFAULT_COMMAND_TIMEOUT,
+                   dosbox_version: str | None = None, out: str | Path | None = None) -> dict:
+    """Read bounded conventional RAM bytes from a stopped DOSBox-X debugger."""
+    if not (isinstance(segment, int) and not isinstance(segment, bool) and 0 <= segment <= 0xFFFF
+            and isinstance(offset, int) and not isinstance(offset, bool) and 0 <= offset <= 0xFFFF):
+        raise DDTError(f"segment and offset must each be 0..65535: {segment!r}:{offset!r}")
+    if not isinstance(length, int) or isinstance(length, bool) or not 1 <= length <= MAX_MEMORY_BYTES:
+        raise DDTError(f"length must be an integer in 1..{MAX_MEMORY_BYTES}: {length!r}")
+    requested = f"{_hex16(segment)}:{_hex16(offset)}"
+    commands: list[dict] = []
+    rid = 0
+    initial = final = None
+
+    def next_rid() -> int:
+        nonlocal rid
+        rid += 1
+        return rid
+
+    def observe_registers(conn: socket.socket) -> dict:
+        response = _request(conn, next_rid(), "EXEC EV " + " ".join(REGISTERS), command_timeout)
+        commands.append(response)
+        registers = _parse_registers(response["raw"]) if response["status"] == "OK" else None
+        if registers is None:
+            raise DDTError(f"could not read the CPU registers: {response['raw']}")
+        return {"registers": registers, "cs_ip": f"{registers['CS']}:{registers['IP']}"}
+
+    with _accepted_connection(port, timeout) as conn:
+        commands.append(_request(conn, next_rid(), "PING", command_timeout))
+        if commands[-1]["status"] != "OK" or commands[-1]["raw"] != ["PONG"]:
+            raise DDTError("DOSBox-X debugger did not answer PING with PONG")
+        if settle > 0:
+            time.sleep(settle)
+        help_response = _request(conn, next_rid(), "EXEC HELP", command_timeout)
+        commands.append(help_response)
+        if help_response["status"] != "OK":
+            raise DDTError("could not read the debugger command list to check MEMREAD support "
+                           f"(EXEC HELP was refused: {help_response['raw']})")
+        advertised = _advertises(help_response["raw"], "MEMREAD")
+        capability = {"checked_with": "EXEC HELP", "memread_advertised": advertised,
+                      "evidence": [line.strip() for line in help_response["raw"]
+                                   if line.strip().split(None, 1)[:1] == ["MEMREAD"]]}
+        if not advertised:
+            raise DDTError("Connected DOSBox-X debugger does not advertise MEMREAD; use a "
+                           "debugger-enabled build with bounded memory observation support.")
+        initial = observe_registers(conn)
+        read_response = _request(conn, next_rid(),
+                                 f"EXEC MEMREAD {requested} {_hex16(length)}", command_timeout)
+        commands.append(read_response)
+        if read_response["status"] != "OK":
+            raise DDTError(f"the debugger refused the memory read: {read_response['raw']}")
+        parsed = _parse_memread_line(read_response["raw"])
+        if parsed is None:
+            raise DDTError(f"the MEMREAD response did not report address, length and bytes "
+                           f"({read_response['raw']!r})")
+        if parsed["segment"] != _hex16(segment) or parsed["offset"] != _hex16(offset):
+            raise DDTError(f"the MEMREAD response is for {parsed['segment']}:{parsed['offset']}, "
+                           f"not {requested}")
+        if parsed["length"] != length:
+            raise DDTError(f"the MEMREAD response reports {parsed['length']} bytes, not {length}")
+        if len(parsed["hex"]) != length * 2:
+            raise DDTError(f"the MEMREAD response returned {len(parsed['hex']) // 2} bytes of hex, "
+                           f"not {length}")
+        final = observe_registers(conn)
+        if final["cs_ip"] != initial["cs_ip"]:
+            raise DDTError(f"CS:IP moved during the memory read ({initial['cs_ip']} -> "
+                           f"{final['cs_ip']}); the observation is not trustworthy")
+
+    unknown = ["whether the read had side effects on emulated hardware (conventional RAM only "
+               "was requested)",
+               "whether the emulator is paused or running (no stopped-state query exists)"]
+    if not dosbox_version:
+        unknown.append("DOSBox-X build identity (not queried over the protocol)")
+    record = {
+        "schema": MEMORY_SCHEMA,
+        "endpoint": {"host": "127.0.0.1", "port": port},
+        "protocol": PROTOCOL,
+        "dosbox_version": dosbox_version,
+        "capability": capability,
+        "request": {"segment": _hex16(segment), "offset": _hex16(offset), "length": length,
+                    "cs_ip": requested, "command": read_response["request"]},
+        "response": {"raw": read_response["raw"],
+                     "address": f"{parsed['segment']}:{parsed['offset']}",
+                     "length": parsed["length"]},
+        "bytes_hex": parsed["hex"],
+        "byte_count": length,
+        "read_success": True,
+        "initial": initial,
+        "final": final,
+        "cs_ip_unchanged": True,
+        "paused_state": "unknown",
+        "commands": commands,
+        "unknown": unknown,
+        "limits": list(_MEMORY_LIMITS),
+    }
+    if out is not None:
+        _write_json(Path(out), record)
+    return record
+
+
 def capture_steps(port: int = DEFAULT_PORT, *, count: int = DEFAULT_STEPS, settle: float = 3.0,
                   timeout: float = DEFAULT_TIMEOUT, command_timeout: float = DEFAULT_COMMAND_TIMEOUT,
                   dosbox_version: str | None = None, out: str | Path | None = None,
@@ -371,7 +496,7 @@ def capture_steps(port: int = DEFAULT_PORT, *, count: int = DEFAULT_STEPS, settl
         if help_response["status"] != "OK":
             raise DDTError("could not read the debugger command list to check STEPIN support "
                            f"(EXEC HELP was refused: {help_response['raw']})")
-        advertised = _advertises_stepin(help_response["raw"])
+        advertised = _advertises(help_response["raw"], "STEPIN")
         capability = {"checked_with": "EXEC HELP", "stepin_advertised": advertised,
                       "evidence": [line.strip() for line in help_response["raw"]
                                    if line.strip().split(None, 1)[:1] == ["STEPIN"]]}
