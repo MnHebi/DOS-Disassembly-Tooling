@@ -31,17 +31,20 @@ def _write(tmp_path, record, name="export.json") -> Path:
     return path
 
 
-def test_callers_selects_only_call_references(tmp_path):
+def test_callers_separate_direct_computed_and_external(tmp_path):
     record = _record(incoming=[
         _ref("Entry Point", "1000:0000", "EXTERNAL", flow=False),
         _ref("1000:0010", "1000:0000", "CONDITIONAL_CALL"),
+        _ref("1000:0020", "1000:0000", "COMPUTED_CALL", computed=True),
+        _ref("1000:0030", "EXT:0001", "UNCONDITIONAL_CALL", external=True),
     ])
     result = code.callers(_write(tmp_path, record))
-    assert result["schema"] == "ddt.code-callers.v1"
-    assert result["callers"] == [{"from": "1000:0010", "to": "1000:0000",
-                                  "type": "CONDITIONAL_CALL", "computed": False,
-                                  "external": False}]
-    assert result["caller_count"] == 1
+    assert result["schema"] == "ddt.code-callers.v2"
+    assert [c["from"] for c in result["direct_callers"]] == ["1000:0010"]
+    assert [c["from"] for c in result["computed_callers"]] == ["1000:0020"]
+    assert [c["from"] for c in result["external_callers"]] == ["1000:0030"]
+    assert result["direct_caller_count"] == 1
+    assert any("not proven direct" in limit for limit in result["limits"])
     assert any("entry point" in limit for limit in result["limits"])
 
 
@@ -64,6 +67,7 @@ def test_callees_classify_calls_and_ignore_non_calls(tmp_path):
     assert [c["text"] for c in result["unresolved_calls"]] == ["INT 0x21"]
     assert result["direct_call_count"] == 1
     assert any("not proven direct" in limit for limit in result["limits"])
+    assert any("referenced destination address" in limit for limit in result["limits"])
 
 
 def test_truncation_indicators_are_preserved(tmp_path):

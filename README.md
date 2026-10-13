@@ -54,7 +54,7 @@ Limitations: instruction bytes are read from the loaded program image and may di
 
 ## Function navigation (offline)
 
-`ddt code callers --export func.json` and `ddt code callees --export func.json` answer direct relationship questions from an existing export, with no Ghidra run and no re-reading of the executable. Callers reports the direct call references that target the function entry; callees separates proven direct calls from computed/indirect calls, externally resolved calls, and unresolved (indirect) calls. Both output a compact versioned record (`ddt.code-callers.v1` / `ddt.code-callees.v1`).
+`ddt code callers --export func.json` and `ddt code callees --export func.json` answer direct relationship questions from an existing export, with no Ghidra run and no re-reading of the executable. Callers reports call references that target the function entry, separating direct, computed/indirect, and externally resolved ones; callees does the same for outgoing calls, plus unresolved (indirect) calls. Both output a compact versioned record (`ddt.code-callers.v2` / `ddt.code-callees.v1`).
 
 These are deliberately bounded: a single exported function does not describe the whole program, incoming references cover the entry point only, caller function names are unavailable, indirect or aliased calls may be unresolved, and the export's own limits may truncate reference collections (the response reports truncation, marking it unknown for older exports). Direct call targets are call-site addresses, not verified function entry points.
 

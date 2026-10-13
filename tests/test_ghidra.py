@@ -257,6 +257,6 @@ def test_integration_export_matches_fixture(tmp_path):
     assert entry_callees["direct_calls"][0]["computed"] is False
     assert any(c["text"] == "INT 0x21" for c in entry_callees["unresolved_calls"])
     assert entry_callees["references_truncated"] is False
-    assert code.callers(tmp_path / "entry.json")["callers"] == []
-    callee_callers = code.callers(tmp_path / "callee.json")["callers"]
+    assert code.callers(tmp_path / "entry.json")["direct_callers"] == []
+    callee_callers = code.callers(tmp_path / "callee.json")["direct_callers"]
     assert [(c["from"], c["to"]) for c in callee_callers] == [("1000:0000", "1000:000c")]

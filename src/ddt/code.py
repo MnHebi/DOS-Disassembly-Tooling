@@ -13,7 +13,7 @@ from pathlib import Path
 from .errors import DDTError
 from .ghidra import SCHEMA
 
-CALLERS_SCHEMA = "ddt.code-callers.v1"
+CALLERS_SCHEMA = "ddt.code-callers.v2"
 CALLEES_SCHEMA = "ddt.code-callees.v1"
 
 
@@ -60,18 +60,29 @@ def _truncation_limit(label: str, truncated) -> str:
 
 
 def callers(export: str | Path) -> dict:
-    """Report direct call references whose target is this function's entry point."""
+    """Report call references whose target is this function's entry point."""
     record = _load(export)
     function = record["function"]
-    calls = [_reference(ref) for ref in function.get("incoming_references", [])
-             if isinstance(ref, dict) and _is_call(ref)]
+    direct, computed, external = [], [], []
+    for ref in function.get("incoming_references", []):
+        if not isinstance(ref, dict) or not _is_call(ref):
+            continue
+        entry = _reference(ref)
+        if entry["external"]:
+            external.append(entry)
+        elif entry["computed"]:
+            computed.append(entry)
+        else:
+            direct.append(entry)
     truncated = function.get("incoming_references_truncated")
     limits = ["Incoming references cover only the selected function's entry point",
+              "Computed or indirect callers are not proven direct call sites",
               "Caller function names are not available from a single-function export",
-              "Indirect or aliased callers may be unresolved",
+              "Indirect or aliased callers may be unresolved and are listed separately",
               _truncation_limit("incoming reference", truncated)]
     return {"schema": CALLERS_SCHEMA, "direction": "callers", "source": _source(record),
-            "callers": calls, "caller_count": len(calls),
+            "direct_callers": direct, "computed_callers": computed, "external_callers": external,
+            "direct_caller_count": len(direct),
             "references_truncated": truncated, "limits": limits}
 
 
@@ -96,7 +107,8 @@ def callees(export: str | Path) -> dict:
                   if isinstance(item, dict) and "CALL" in str(item.get("flow_type", "")).upper()]
     limits = ["One function is described; this is not whole-program call-graph reconstruction",
               "Computed or indirect calls are not proven direct call targets",
-              "A direct call target is a call site's address, not a verified function entry",
+              "A direct call target is a referenced destination address, "
+              "not necessarily a verified function entry point",
               "Indirect calls may remain unresolved and are listed separately",
               _truncation_limit("outgoing reference", function.get("outgoing_references_truncated"))]
     return {"schema": CALLEES_SCHEMA, "direction": "callees", "source": _source(record),
