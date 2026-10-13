@@ -18,7 +18,7 @@ A small, read-only, cross-platform toolkit for examining 16-bit DOS executables.
 - Binary file and directory comparison with exact differing spans, bounded hexadecimal previews and exact run counts
 - Printable-string extraction with exact original file offsets
 - Read-only export of one analyzed function from an existing Ghidra project (optional; Ghidra is not needed for any other command)
-- Offline direct caller/callee navigation over an exported function (no Ghidra required)
+- Offline navigation over an exported function: direct callers/callees and memory readers/writers (no Ghidra required)
 - Read-only identification of DOS containers, embedded signatures and packaging markers
 - Read-only runtime capture intake: compare an operator's before/after artifact snapshots
 - Versioned JSON output and a nonzero exit code on invalid input
@@ -44,6 +44,8 @@ ddt capture intake --before ./capture-before --after ./capture-after --json
 ddt ghidra export --project ./proj --program GAME.EXE --function 1000:0000 --out func.json --json
 ddt code callers --export func.json --json
 ddt code callees --export func.json --json
+ddt code readers --export func.json --address 1000:1234 --json
+ddt code writers --export func.json --address 1000:1234 --json
 python -m pytest -q
 ```
 
@@ -62,6 +64,8 @@ Limitations: instruction bytes are read from the loaded program image and may di
 `ddt code callers --export func.json` and `ddt code callees --export func.json` answer direct relationship questions from an existing export, with no Ghidra run and no re-reading of the executable. Callers reports call references that target the function entry, separating direct, computed/indirect, and externally resolved ones; callees does the same for outgoing calls, plus unresolved (indirect) calls. Both output a compact versioned record (`ddt.code-callers.v2` / `ddt.code-callees.v1`).
 
 These are deliberately bounded: a single exported function does not describe the whole program, incoming references cover the entry point only, caller function names are unavailable, indirect or aliased calls may be unresolved, and the export's own limits may truncate reference collections (the response reports truncation, marking it unknown for older exports). Direct call targets are referenced destination addresses, not necessarily verified function entry points.
+
+`ddt code readers --export func.json --address 1000:1234` and `ddt code writers --export func.json --address 1000:1234` report the instructions in that exported function whose Ghidra references are classified as reading or writing the given **Ghidra address** (`ddt.code-readers.v1` / `ddt.code-writers.v1`). Calls, jumps and other control flow are excluded, direct and computed/indirect matches are listed separately, and address-space identity is preserved (the address text must match exactly, so different spaces or destinations never collide). Results are Ghidra's static reference classification — analysis evidence, not proof of an executed access. For exports predating the read/write flags, references are classified only by exact Ghidra reference-type names and anything else is counted as unclassified rather than guessed. These queries cover one exported function: other functions, indirect/unresolved accesses, pointer writes, interprocedural effects and segment aliases are out of scope, so an empty result means "no matching direct reference in this export", not "nothing in the program touches this address".
 
 ## Format identification (identification-only)
 

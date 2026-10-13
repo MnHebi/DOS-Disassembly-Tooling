@@ -8,7 +8,7 @@ import sys
 
 from . import __version__
 from .capture import intake
-from .code import callees, callers
+from .code import callees, callers, readers, writers
 from .diff import compare, manifest
 from .errors import DDTError
 from .format import inspect, map_address
@@ -79,6 +79,12 @@ def main(argv: list[str] | None = None) -> int:
         sub = code_sub.add_parser(direction, help=help_text)
         sub.add_argument("--export", required=True, type=Path, help="Exported ddt.ghidra-function.v1 JSON")
         sub.add_argument("--json", action="store_true")
+    for direction, help_text in (("readers", "Instructions with direct reads of a Ghidra address"),
+                                 ("writers", "Instructions with direct writes of a Ghidra address")):
+        sub = code_sub.add_parser(direction, help=help_text)
+        sub.add_argument("--export", required=True, type=Path, help="Exported ddt.ghidra-function.v1 JSON")
+        sub.add_argument("--address", required=True, help="Ghidra address, e.g. 1000:1234")
+        sub.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "inspect":
@@ -98,7 +104,14 @@ def main(argv: list[str] | None = None) -> int:
             output = export_function(args.project, args.program, args.function, args.out,
                                      ghidra=args.ghidra, java_home=args.java_home, timeout=args.timeout)
         elif args.command == "code":
-            output = callers(args.export) if args.code_command == "callers" else callees(args.export)
+            if args.code_command == "callers":
+                output = callers(args.export)
+            elif args.code_command == "callees":
+                output = callees(args.export)
+            elif args.code_command == "readers":
+                output = readers(args.export, args.address)
+            else:
+                output = writers(args.export, args.address)
         else:
             output = manifest(args.path)
         print(json.dumps(output, indent=2, sort_keys=True))

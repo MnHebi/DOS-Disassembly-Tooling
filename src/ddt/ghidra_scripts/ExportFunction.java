@@ -262,6 +262,8 @@ public class ExportFunction extends GhidraScript {
         info.put("type", type.toString());
         info.put("computed", type.isComputed());
         info.put("flow", type.isFlow());
+        info.put("read", type.isRead());
+        info.put("write", type.isWrite());
         info.put("external", reference.isExternalReference());
         info.put("memory", reference.isMemoryReference());
         info.put("offset", reference.isOffsetReference());

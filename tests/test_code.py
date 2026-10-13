@@ -131,3 +131,98 @@ def test_cli_code_navigation_runs_without_ghidra(tmp_path):
     payload = json.loads(proc.stdout)
     assert payload["schema"] == "ddt.code-callees.v1"
     assert payload["direct_calls"][0]["to"] == "1000:000c"
+
+
+# --- Memory readers / writers ------------------------------------------------
+
+ADDRESS = "1000:1234"
+
+
+def _mem(source, target, type_, *, flow=False, computed=False, external=False,
+         read=None, write=None):
+    entry = {"from": source, "to": target, "type": type_, "computed": computed,
+             "flow": flow, "external": external, "memory": True, "offset": False}
+    if read is not None:
+        entry["read"] = read
+    if write is not None:
+        entry["write"] = write
+    return entry
+
+
+def test_readers_and_writers_classify_memory_access(tmp_path):
+    record = _record(outgoing=[
+        _mem("1000:0000", ADDRESS, "READ", read=True, write=False),
+        _mem("1000:0003", ADDRESS, "WRITE", read=False, write=True),
+        _mem("1000:0006", ADDRESS, "READ_WRITE", read=True, write=True),
+        _mem("1000:0009", ADDRESS, "DATA", read=False, write=False),
+        _mem("1000:000c", ADDRESS, "UNCONDITIONAL_CALL", flow=True),
+    ])
+    path = _write(tmp_path, record)
+    finders = code.readers(path, ADDRESS)
+    writers = code.writers(path, ADDRESS)
+    assert finders["schema"] == "ddt.code-readers.v1"
+    assert writers["schema"] == "ddt.code-writers.v1"
+    assert [e["from"] for e in finders["direct"]] == ["1000:0000", "1000:0006"]
+    assert [e["from"] for e in writers["direct"]] == ["1000:0003", "1000:0006"]
+    assert writers["direct_count"] == 2
+    assert finders["address"] == ADDRESS and finders["source"]["function_entry"] == "1000:0000"
+    # A read/write reference must appear in both directions.
+    assert "1000:0006" in {e["from"] for e in finders["direct"]} \
+        and "1000:0006" in {e["from"] for e in writers["direct"]}
+
+
+def test_computed_accesses_are_not_proven_direct(tmp_path):
+    record = _record(outgoing=[_mem("1000:0000", ADDRESS, "READ", read=True, write=False, computed=True)])
+    result = code.readers(_write(tmp_path, record), ADDRESS)
+    assert result["direct"] == []
+    assert [e["from"] for e in result["computed"]] == ["1000:0000"]
+    assert result["computed_count"] == 1
+    assert any("not proven" in limit for limit in result["limits"])
+
+
+def test_address_and_space_must_match_exactly(tmp_path):
+    record = _record(outgoing=[
+        _mem("1000:0000", ADDRESS, "READ", read=True, write=False),
+        _mem("1000:0003", "1000:9999", "READ", read=True, write=False),
+        _mem("1000:0006", "OTHER::00001234", "READ", read=True, write=False),
+    ])
+    result = code.readers(_write(tmp_path, record), ADDRESS)
+    assert [e["from"] for e in result["direct"]] == ["1000:0000"]
+
+
+def test_legacy_exports_classified_by_exact_type_name(tmp_path):
+    record = _record(outgoing=[
+        _mem("1000:0000", ADDRESS, "READ"),
+        _mem("1000:0003", ADDRESS, "WRITE"),
+        _mem("1000:0006", ADDRESS, "DATA"),
+    ])
+    result = code.readers(_write(tmp_path, record), ADDRESS)
+    assert [e["from"] for e in result["direct"]] == ["1000:0000"]
+    assert result["unclassified_count"] == 1
+    assert any("exact Ghidra reference-type name" in limit for limit in result["limits"])
+
+
+def test_truncation_is_reported_for_access_queries(tmp_path):
+    record = _record(outgoing=[_mem("1000:0000", ADDRESS, "READ", read=True, write=False)],
+                     outgoing_reference_count=5000, outgoing_references_truncated=True)
+    result = code.writers(_write(tmp_path, record), ADDRESS)
+    assert result["direct"] == []
+    assert result["references_truncated"] is True
+
+
+def test_access_queries_reject_bad_inputs(tmp_path):
+    with pytest.raises(DDTError, match="unsupported export schema"):
+        code.readers(_write(tmp_path, {"schema": "other", "function": {}}), ADDRESS)
+    with pytest.raises(DDTError, match="address"):
+        code.writers(_write(tmp_path, _record()), "")
+
+
+def test_cli_access_queries_without_ghidra(tmp_path):
+    record = _record(outgoing=[_mem("1000:0000", ADDRESS, "READ", read=True, write=False)])
+    path = _write(tmp_path, record)
+    proc = subprocess.run([sys.executable, "-m", "ddt", "code", "readers", "--export", str(path),
+                           "--address", ADDRESS, "--json"],
+                          check=True, capture_output=True, text=True, env=_dev_env())
+    payload = json.loads(proc.stdout)
+    assert payload["schema"] == "ddt.code-readers.v1"
+    assert payload["direct"][0]["from"] == "1000:0000"

@@ -260,3 +260,9 @@ def test_integration_export_matches_fixture(tmp_path):
     assert code.callers(tmp_path / "entry.json")["direct_callers"] == []
     callee_callers = code.callers(tmp_path / "callee.json")["direct_callers"]
     assert [(c["from"], c["to"]) for c in callee_callers] == [("1000:0000", "1000:000c")]
+    # Ghidra's read/write flags agree with the offline access queries.
+    stack = next(r for r in function["outgoing_references"] if r["type"] == "WRITE")
+    assert stack["write"] is True and stack["read"] is False
+    writers = code.writers(tmp_path / "entry.json", stack["to"])["direct"]
+    assert [e["from"] for e in writers] == [stack["from"]]
+    assert code.readers(tmp_path / "entry.json", stack["to"])["direct"] == []

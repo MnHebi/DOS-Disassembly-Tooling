@@ -15,6 +15,13 @@ from .ghidra import SCHEMA
 
 CALLERS_SCHEMA = "ddt.code-callers.v2"
 CALLEES_SCHEMA = "ddt.code-callees.v1"
+READERS_SCHEMA = "ddt.code-readers.v1"
+WRITERS_SCHEMA = "ddt.code-writers.v1"
+
+# Exact Ghidra reference-type names used only when an export predates the
+# explicit read/write flags. No substring matching, so nothing is misclassified.
+_LEGACY_READ_TYPES = frozenset({"READ", "READ_WRITE", "READ_IND", "READ_WRITE_IND"})
+_LEGACY_WRITE_TYPES = frozenset({"WRITE", "READ_WRITE", "WRITE_IND", "READ_WRITE_IND"})
 
 
 def _load(export: str | Path) -> dict:
@@ -117,3 +124,66 @@ def callees(export: str | Path) -> dict:
             "references_truncated": function.get("outgoing_references_truncated"),
             "unresolved_truncated": function.get("unresolved_flow_truncated"),
             "limits": limits}
+
+
+def _access(reference: dict) -> tuple[bool, bool, bool]:
+    """(reads, writes, classified): explicit flags when present, else exact type names."""
+    if "read" in reference or "write" in reference:
+        return bool(reference.get("read")), bool(reference.get("write")), True
+    name = str(reference.get("type") or "").upper()
+    return name in _LEGACY_READ_TYPES, name in _LEGACY_WRITE_TYPES, name in _LEGACY_READ_TYPES | _LEGACY_WRITE_TYPES
+
+
+def _access_query(export: str | Path, address: str, want: str, schema: str, direction: str) -> dict:
+    if not isinstance(address, str) or not address:
+        raise DDTError("address must be a non-empty Ghidra address string")
+    record = _load(export)
+    function = record["function"]
+    refs = [ref for ref in function.get("outgoing_references", []) if isinstance(ref, dict)]
+    # Older exports may lack the explicit flags entirely; say so rather than guess.
+    legacy = not any("read" in ref or "write" in ref for ref in refs)
+    direct, computed, unclassified = [], [], 0
+    for ref in refs:
+        # Match the Ghidra address text exactly, so a different address or a
+        # different address space can never be equated with the request.
+        if ref.get("to") != address or ref.get("flow"):
+            continue
+        reads, writes, classified = _access(ref)
+        if not classified:
+            unclassified += 1
+            continue
+        if not (reads if want == "read" else writes):
+            continue
+        entry = {"from": ref.get("from"), "to": ref.get("to"), "type": ref.get("type"),
+                 "computed": bool(ref.get("computed")), "memory": bool(ref.get("memory")),
+                 "external": bool(ref.get("external"))}
+        (computed if entry["computed"] else direct).append(entry)
+    truncated = function.get("outgoing_references_truncated")
+    limits = ["Only one exported function was searched; other functions were not examined",
+              "Computed or indirect matches are listed separately and are not proven "
+              "accesses to the exact address",
+              "Segment aliases can name the same memory through different addresses",
+              "Ghidra's static reference classification is analysis evidence, not proof "
+              "of an executed access",
+              "Writes through pointers and interprocedural effects are outside scope",
+              _truncation_limit("outgoing reference", truncated)]
+    if legacy:
+        limits.append("This export has no read/write flags; references were classified by "
+                      "exact Ghidra reference-type name")
+    if unclassified:
+        limits.append(f"{unclassified} matching reference(s) could not be classified as a read or write")
+    return {"schema": schema, "direction": direction, "address": address,
+            "source": _source(record), "direct": direct, "computed": computed,
+            "direct_count": len(direct), "computed_count": len(computed),
+            "unclassified_count": unclassified, "references_truncated": truncated,
+            "limits": limits}
+
+
+def readers(export: str | Path, address: str) -> dict:
+    """Report instructions with direct Ghidra references reading the given address."""
+    return _access_query(export, address, "read", READERS_SCHEMA, "readers")
+
+
+def writers(export: str | Path, address: str) -> dict:
+    """Report instructions with direct Ghidra references writing the given address."""
+    return _access_query(export, address, "write", WRITERS_SCHEMA, "writers")
