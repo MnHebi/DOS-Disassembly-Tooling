@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 
 from . import __version__
+from .capture import intake
 from .code import callees, callers
 from .diff import compare, manifest
 from .errors import DDTError
@@ -51,6 +52,15 @@ def main(argv: list[str] | None = None) -> int:
     idn.add_argument("path", type=Path)
     idn.add_argument("--format", choices=["auto", "mz", "com"], default="auto")
     idn.add_argument("--json", action="store_true")
+    cap = commands.add_parser("capture", help="Read-only intake of paired artifact captures")
+    cap_sub = cap.add_subparsers(dest="capture_command", required=True)
+    ci = cap_sub.add_parser("intake", help="Compare a before/after capture and record a receipt")
+    ci.add_argument("--before", required=True, type=Path)
+    ci.add_argument("--after", required=True, type=Path)
+    ci.add_argument("--out", type=Path, default=None, help="Write the receipt outside both captures")
+    ci.add_argument("--note", default=None, help="Operator-supplied note (user metadata, not evidence)")
+    ci.add_argument("--max-runs", type=int, default=128)
+    ci.add_argument("--json", action="store_true")
     gh = commands.add_parser("ghidra", help="Optional read-only Ghidra integration")
     gh_sub = gh.add_subparsers(dest="ghidra_command", required=True)
     gx = gh_sub.add_parser("export", help="Export one analyzed function from an existing Ghidra project")
@@ -81,6 +91,9 @@ def main(argv: list[str] | None = None) -> int:
             output = extract(args.path, args.min_length, args.max_results)
         elif args.command == "identify":
             output = identify(args.path, args.format)
+        elif args.command == "capture":
+            output = intake(args.before, args.after, out=args.out, note=args.note,
+                            max_runs=args.max_runs)
         elif args.command == "ghidra":
             output = export_function(args.project, args.program, args.function, args.out,
                                      ghidra=args.ghidra, java_home=args.java_home, timeout=args.timeout)

@@ -20,13 +20,14 @@ A small, read-only, cross-platform toolkit for examining 16-bit DOS executables.
 - Read-only export of one analyzed function from an existing Ghidra project (optional; Ghidra is not needed for any other command)
 - Offline direct caller/callee navigation over an exported function (no Ghidra required)
 - Read-only identification of DOS containers, embedded signatures and packaging markers
+- Read-only runtime capture intake: compare an operator's before/after artifact snapshots
 - Versioned JSON output and a nonzero exit code on invalid input
 - Native Linux and Windows packaging workflow using native runners
 
 ## Planned (not yet implemented)
 
 - Recursive call graphs and writers/readers/slice queries (only direct callers and callees exist today)
-- Optional capture intake and evidence indexing with hashes and provenance
+- Searchable evidence indexing across many captures (single before/after intake exists today)
 
 ## Installation and usage
 
@@ -39,6 +40,7 @@ ddt diff before/ after/ --json
 ddt manifest before/ --json
 ddt strings GAME.EXE --json
 ddt identify PROGRAM.EXE --json
+ddt capture intake --before ./capture-before --after ./capture-after --json
 ddt ghidra export --project ./proj --program GAME.EXE --function 1000:0000 --out func.json --json
 ddt code callers --export func.json --json
 ddt code callees --export func.json --json
@@ -71,6 +73,14 @@ These are deliberately bounded: a single exported function does not describe the
 - **Appended data**: bytes past the MZ declared image are reported as a region with `purpose: unknown` unless a recognized structure begins exactly there; appended bytes are never equated with code.
 
 Each finding carries a `classification` of `identified`, `candidate` or `unknown`, plus the exact basis. Not yet recognized: `PKLITE` and `EXEPACK` (no reliably anchored, independently verifiable signature), and DJGPP/GO32 identity beyond a candidate `go32stub` marker. `ddt inspect` and `ddt address` keep their existing MZ/COM behavior.
+
+## Runtime capture intake
+
+`ddt capture intake --before DIR --after DIR` compares two directories the operator collected around one action, reusing DDT's manifest and byte-comparison primitives. It is read-only: it never modifies, copies or renames anything in either capture, and it reports added/removed/unchanged/modified counts, per-file lengths and SHA-256 hashes, exact relative paths, and bounded changed-byte previews with full run counts. The receipt (`ddt.capture-intake.v1`) can be written outside the captures with `--out`; writing it inside either capture is rejected. A `--note` is recorded as user-supplied metadata, not as verified fact.
+
+Intended workflow: (1) prepare an isolated DOS application environment and pick one action to investigate; (2) have the operator take a BEFORE snapshot using the application's normal controls; (3) perform the single action; (4) take an AFTER snapshot; (5) run `ddt capture intake`; (6) keep the original artifacts and the receipt.
+
+A receipt states what DDT read and what differs — it does not prove which application, executable or runtime session produced the captures, and it does not attribute any difference to the action. DDT does not drive the emulator or simulate input.
 
 ## Distribution builds
 
