@@ -28,6 +28,39 @@ def _coff_image(*, machine=0x014C, sections=1, optional_size=0, body=b"\x90" * 8
     return header + b"\x00" * (optional_size + sections * 40) + body
 
 
+def _ne_header() -> bytes:
+    blob = bytearray(0x48)
+    blob[0:2] = b"NE"
+    struct.pack_into("<H", blob, 0x1C, 1)      # one segment
+    struct.pack_into("<H", blob, 0x22, 0x40)   # segment table at 0x40
+    return bytes(blob)
+
+
+def _le_header(signature: bytes) -> bytes:
+    blob = bytearray(0x20)
+    blob[0:2] = signature
+    struct.pack_into("<H", blob, 2, 0)         # little-endian marker
+    struct.pack_into("<H", blob, 8, 2)         # i386
+    struct.pack_into("<H", blob, 0x0A, 4)      # Windows
+    return bytes(blob)
+
+
+def _pe_header() -> bytes:
+    blob = bytearray(24 + 224 + 40)
+    blob[0:4] = b"PE\x00\x00"
+    struct.pack_into("<H", blob, 6, 1)         # one section
+    struct.pack_into("<H", blob, 20, 224)      # optional header size
+    struct.pack_into("<H", blob, 24, 0x10B)    # PE32 magic
+    return bytes(blob)
+
+
+def _with_secondary(secondary: bytes, image: bytes = b"\x90" * 16) -> bytes:
+    base = _mz(image)
+    data = bytearray(base + secondary)
+    struct.pack_into("<I", data, 0x3C, len(base))
+    return bytes(data)
+
+
 def _write(tmp_path, data: bytes, name="sample.bin") -> Path:
     path = tmp_path / name
     path.write_bytes(data)
@@ -54,22 +87,40 @@ def test_com_requires_explicit_selection(tmp_path):
     assert _kinds(record) == ["dos-com"]
 
 
-@pytest.mark.parametrize("signature,kind", [(b"NE", "ne"), (b"LE", "le"), (b"LX", "lx"),
-                                            (b"PE\x00\x00", "pe")])
-def test_secondary_headers_are_recognized_unsupported(tmp_path, signature, kind):
-    base = _mz(b"\x90" * 16)
-    offset = len(base)
-    data = base + signature + b"\x00" * 64
-    data = data[:0x3C] + struct.pack("<I", offset) + data[0x40:]
+@pytest.mark.parametrize("secondary,kind", [(_ne_header(), "ne"), (_le_header(b"LE"), "le"),
+                                            (_le_header(b"LX"), "lx"), (_pe_header(), "pe")])
+def test_valid_secondary_headers_are_identified(tmp_path, secondary, kind):
+    data = _with_secondary(secondary)
     record = identify_mod.identify(_write(tmp_path, data))
     header = next(f for f in record["findings"] if f["kind"] == kind)
     assert header["classification"] == "identified"
     assert header["supported"] is False
-    assert header["offset"] == offset
     assert record["appended"]["recognized_structure"] == kind
     # inspect still refuses these as conventional DOS MZ targets.
     with pytest.raises(DDTError):
         inspect(_write(tmp_path, data, name="secondary.exe"))
+
+
+def test_truncated_secondary_header_is_unknown_without_rejection(tmp_path):
+    data = _with_secondary(b"NE\x00\x00\x00\x00\x00\x00")  # 8 bytes, short of 0x40
+    record = identify_mod.identify(_write(tmp_path, data))
+    header = next(f for f in record["findings"] if f["kind"] == "ne")
+    assert header["classification"] == "unknown"
+    # An incomplete signature must not make inspect reject an otherwise valid MZ.
+    assert inspect(_write(tmp_path, data, name="stub.exe")).to_dict()["format"] == "dos-mz"
+
+
+def test_inconsistent_secondary_header_is_candidate(tmp_path):
+    bad_ne = bytearray(_ne_header())
+    struct.pack_into("<H", bad_ne, 0x22, 0x7FFF)      # segment table far out of bounds
+    bad_pe = bytearray(_pe_header())
+    struct.pack_into("<H", bad_pe, 20, 0)             # no Windows COFF optional header
+    for blob, kind in ((bytes(bad_ne), "ne"), (bytes(bad_pe), "pe")):
+        data = _with_secondary(blob)
+        record = identify_mod.identify(_write(tmp_path, data, name=f"{kind}.bin"))
+        header = next(f for f in record["findings"] if f["kind"] == kind)
+        assert header["classification"] == "candidate"
+        assert inspect(_write(tmp_path, data, name=f"i-{kind}.exe")).to_dict()["format"] == "dos-mz"
 
 
 def test_out_of_bounds_or_incidental_signature_is_not_secondary(tmp_path):
@@ -126,11 +177,17 @@ def test_go32_stub_requires_load_image_start(tmp_path):
     assert "go32-stub" not in _kinds(identify_mod.identify(_write(tmp_path, elsewhere)))
 
 
-def test_validated_coff_and_false_positive(tmp_path):
+def test_coff_candidate_and_rejected_raw_extents(tmp_path):
     valid = identify_mod.identify(_write(tmp_path, _coff_image(), name="image.coff"))
     assert valid["outer_format"] == "i386-coff"
     coff = next(f for f in valid["findings"] if f["kind"] == "i386-coff")
-    assert coff["classification"] == "identified" and coff["loader_identity"] == "unknown"
+    assert coff["classification"] == "candidate" and coff["loader_identity"] == "unknown"
+    # Section table fits, but the declared raw section data runs past end-of-file.
+    bad_raw = bytearray(_coff_image())
+    struct.pack_into("<I", bad_raw, 36, 0x1000)       # SizeOfRawData
+    struct.pack_into("<I", bad_raw, 40, 0x1000)       # PointerToRawData
+    rejected_raw = identify_mod.identify(_write(tmp_path, bytes(bad_raw), name="badraw.coff"))
+    assert "i386-coff" not in _kinds(rejected_raw)
     # Plausible i386 machine word but a section table that runs past end-of-file.
     misleading = _coff_image(sections=5)[:40]
     rejected = identify_mod.identify(_write(tmp_path, misleading, name="bad.coff"))

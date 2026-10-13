@@ -10,7 +10,7 @@ from pathlib import Path
 import struct
 
 from .errors import DDTError
-from .format import MAX_COM_SIZE, _read_input, _secondary_header, parse_mz
+from .format import MAX_COM_SIZE, _read_input, parse_mz, secondary_status
 
 SCHEMA = "ddt.identify.v1"
 COFF_MACHINE_I386 = 0x014C
@@ -47,17 +47,23 @@ def _coff_image(data: bytes, offset: int) -> dict | None:
     table_end = offset + 20 + optional_size + sections * 40
     if table_end > len(data):
         return None
+    # A plausible header is not enough: any declared raw section data must fit too.
+    for index in range(sections):
+        section = offset + 20 + optional_size + index * 40
+        raw_size = struct.unpack_from("<I", data, section + 16)[0]
+        raw_offset = struct.unpack_from("<I", data, section + 20)[0]
+        if raw_size and raw_offset + raw_size > len(data):
+            return None
     return {"offset": offset, "machine": "i386", "sections": sections,
             "size_of_optional_header": optional_size, "section_table_end": table_end}
 
 
 def _secondary_finding(data: bytes) -> dict | None:
-    secondary = _secondary_header(data)
-    if secondary is None:
+    status = secondary_status(data)
+    if status is None:
         return None
-    kind, offset = secondary
-    return _finding(kind, "identified", False, offset=offset,
-                    basis="signature at the outer MZ e_lfanew pointer",
+    return _finding(status["kind"], status["classification"], False, offset=status["offset"],
+                    basis=status["basis"],
                     relationship="secondary header of the outer MZ executable")
 
 
@@ -95,7 +101,7 @@ def identify(path: str | Path, fmt: str = "auto") -> dict:
         outer = "dos-com"
         findings.append(_finding("dos-com", "identified", True, offset=0, length=len(data)))
     else:
-        secondary = _secondary_header(data)
+        secondary = secondary_status(data)
         try:
             mz = parse_mz(data)
         except DDTError as exc:
@@ -122,8 +128,9 @@ def identify(path: str | Path, fmt: str = "auto") -> dict:
         coff = _coff_image(data, anchor)
         if coff is not None:
             findings.append(_finding(
-                "i386-coff", "identified", False, offset=anchor,
-                basis="bounds-validated i386 COFF file header and section table",
+                "i386-coff", "candidate", False, offset=anchor,
+                basis="bounds-validated i386 COFF header, section table and raw-data extents "
+                      "(not a full COFF parse)",
                 loader_identity="unknown"))
             break
     if coff is not None and coff["offset"] == 0 and outer == "unknown":
@@ -141,8 +148,8 @@ def identify(path: str | Path, fmt: str = "auto") -> dict:
     if mz is not None and mz.overlay_bytes > 0:
         start = mz.declared_file_bytes
         recognized = None
-        if secondary is not None and secondary[1] == start:
-            recognized = secondary[0]
+        if secondary is not None and secondary["offset"] == start:
+            recognized = secondary["kind"]
         elif coff is not None and coff["offset"] == start:
             recognized = "i386-coff"
         appended = {"start": start, "length": mz.overlay_bytes,

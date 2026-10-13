@@ -29,13 +29,31 @@ def test_mz_rejects_bad_relocation_table(sample_mz):
         inspect(sample_mz)
 
 
-def test_pe_does_not_get_passed_off_as_dos(sample_mz):
-    data = bytearray(sample_mz.read_bytes())
+def test_bare_pe_signature_is_not_an_established_header(tmp_path):
+    data = bytearray(144)
+    struct.pack_into("<14H", data, 0, 0x5A4D, 128, 1, 0, 4, 0, 0xFFFF, 0, 0xFFFE, 0, 0, 0, 0x1C, 0)
     struct.pack_into("<I", data, 0x3C, 64)
     data[64:68] = b"PE\x00\x00"
-    sample_mz.write_bytes(data)
+    path = tmp_path / "stub.exe"
+    path.write_bytes(bytes(data))
+    # A signature alone does not establish a PE header, so the MZ target stands.
+    assert inspect(path).to_dict()["format"] == "dos-mz"
+
+
+def test_valid_pe_header_is_rejected(tmp_path):
+    base = bytearray(64 + 16)
+    struct.pack_into("<14H", base, 0, 0x5A4D, 80, 1, 0, 4, 0, 0xFFFF, 0, 0xFFFE, 0, 0, 0, 0x1C, 0)
+    pe = bytearray(24 + 224 + 40)
+    pe[0:4] = b"PE\x00\x00"
+    struct.pack_into("<H", pe, 6, 1)
+    struct.pack_into("<H", pe, 20, 224)
+    struct.pack_into("<H", pe, 24, 0x10B)
+    data = base + pe
+    struct.pack_into("<I", data, 0x3C, len(base))
+    path = tmp_path / "pe.exe"
+    path.write_bytes(bytes(data))
     with pytest.raises(DDTError, match="PE executable"):
-        inspect(sample_mz)
+        inspect(path)
 
 
 def test_explicit_com(tmp_path):

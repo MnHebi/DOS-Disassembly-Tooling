@@ -24,8 +24,13 @@ def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _secondary_header(data: bytes) -> tuple[str, int] | None:
-    """Return (kind, file_offset) of a recognised secondary executable header."""
+_SECONDARY_MIN_HEADER = {"ne": 0x40, "le": 0x14, "lx": 0x14, "pe": 24}
+_LE_CPU_TYPES = frozenset({1, 2, 3, 4, 0x20, 0x21, 0x40, 0x41, 0x42})
+_LE_OS_TYPES = (1, 2, 3, 4, 5)
+
+
+def _secondary_kind(data: bytes) -> tuple[str, int] | None:
+    """Return (kind, file_offset) when a secondary signature sits at e_lfanew."""
     if len(data) < 64 or data[:2] not in (b"MZ", b"ZM"):
         return None
     offset = struct.unpack_from("<I", data, 0x3C)[0]
@@ -33,6 +38,69 @@ def _secondary_header(data: bytes) -> tuple[str, int] | None:
         return data[offset:offset + 2].decode("ascii").lower(), offset
     if 64 <= offset <= len(data) - 4 and data[offset:offset + 4] == b"PE\x00\x00":
         return "pe", offset
+    return None
+
+
+def _classify_ne(data: bytes, offset: int) -> tuple[str, str]:
+    segments = struct.unpack_from("<H", data, offset + 0x1C)[0]
+    table = struct.unpack_from("<H", data, offset + 0x22)[0]
+    if segments < 1:
+        return "candidate", "NE signature with no declared segments"
+    if table < 0x40 or offset + table + segments * 8 > len(data):
+        return "candidate", "NE segment table is out of bounds"
+    return "identified", "NE header with an in-bounds segment table"
+
+
+def _classify_le_lx(data: bytes, offset: int, kind: str) -> tuple[str, str]:
+    label = kind.upper()
+    if struct.unpack_from("<H", data, offset + 2)[0] != 0:
+        return "candidate", f"{label} signature without the little-endian marker"
+    cpu = struct.unpack_from("<H", data, offset + 8)[0]
+    os_type = struct.unpack_from("<H", data, offset + 0x0A)[0]
+    if cpu in _LE_CPU_TYPES and os_type in _LE_OS_TYPES:
+        return "identified", f"{label} header with documented CPU and OS fields"
+    return "candidate", f"{label} signature with undocumented CPU or OS fields"
+
+
+def _classify_pe(data: bytes, offset: int) -> tuple[str, str]:
+    sections = struct.unpack_from("<H", data, offset + 6)[0]
+    optional_size = struct.unpack_from("<H", data, offset + 20)[0]
+    magic = struct.unpack_from("<H", data, offset + 24)[0]
+    if optional_size <= 95 or magic not in (0x10B, 0x20B):
+        return "candidate", "PE signature without a recognised Windows COFF optional header"
+    if sections < 1 or offset + 24 + optional_size + sections * 40 > len(data):
+        return "candidate", "PE section table is out of bounds"
+    return "identified", "PE header with a recognised optional header and in-bounds section table"
+
+
+def secondary_status(data: bytes) -> dict | None:
+    """Classify a secondary executable header reached through e_lfanew.
+
+    Returns ``{kind, offset, classification, basis}`` or None when no secondary
+    signature is present. A signature alone is never treated as an established
+    header: insufficient or inconsistent structures stay ``unknown``/``candidate``.
+    """
+    found = _secondary_kind(data)
+    if found is None:
+        return None
+    kind, offset = found
+    if offset + _SECONDARY_MIN_HEADER[kind] > len(data):
+        return {"kind": kind, "offset": offset, "classification": "unknown",
+                "basis": f"{kind.upper()} signature with insufficient header bytes"}
+    if kind == "ne":
+        classification, basis = _classify_ne(data, offset)
+    elif kind == "pe":
+        classification, basis = _classify_pe(data, offset)
+    else:
+        classification, basis = _classify_le_lx(data, offset, kind)
+    return {"kind": kind, "offset": offset, "classification": classification, "basis": basis}
+
+
+def _secondary_header(data: bytes) -> tuple[str, int] | None:
+    """Return (kind, file_offset) only when a secondary header is structurally established."""
+    status = secondary_status(data)
+    if status is not None and status["classification"] == "identified":
+        return status["kind"], status["offset"]
     return None
 
 
