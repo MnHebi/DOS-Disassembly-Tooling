@@ -35,6 +35,9 @@ _LIMITS = [
     "--dosbox-version to record it",
     "The listener accepts one loopback client and one pending command at a time",
     "These values are static-analysis-free observations made at the moment of the break",
+    "An accepted RUN is an acknowledgement, not proof that emulation actually resumed",
+    "DDT cannot tell whether the debugger was already paused before BREAK; --leave-paused "
+    "avoids resuming a user's own paused session",
 ]
 
 
@@ -108,7 +111,7 @@ def _write_json(destination: Path, record: dict) -> None:
 
 def capture_cpu(port: int = DEFAULT_PORT, *, settle: float = 3.0, timeout: float = DEFAULT_TIMEOUT,
                 command_timeout: float = DEFAULT_COMMAND_TIMEOUT, dosbox_version: str | None = None,
-                out: str | Path | None = None) -> dict:
+                out: str | Path | None = None, leave_paused: bool = False) -> dict:
     """Listen for one DOSBox-X debugger connection and record its CPU state."""
     if not isinstance(port, int) or not 1 <= port <= 65535:
         raise DDTError(f"port must be an integer in 1..65535: {port!r}")
@@ -120,7 +123,12 @@ def capture_cpu(port: int = DEFAULT_PORT, *, settle: float = 3.0, timeout: float
         raise DDTError(f"cannot listen on 127.0.0.1:{port}: {exc}") from exc
     server.listen(1)
     commands: list[dict] = []
+    registers: dict[str, str] | None = None
+    cpu_status: list[str] = []
+    broke = False
     resumed = False
+    recovery_error: str | None = None
+    failure: DDTError | None = None
     try:
         server.settimeout(timeout)
         try:
@@ -131,41 +139,54 @@ def capture_cpu(port: int = DEFAULT_PORT, *, settle: float = 3.0, timeout: float
         except OSError as exc:
             raise DDTError(f"listener failed on 127.0.0.1:{port}: {exc}") from exc
         try:
-            if not _loopback(peer[0]):
-                raise DDTError(f"refused non-loopback debugger connection from {peer[0]}")
-            commands.append(_request(conn, 1, "PING", command_timeout))
-            if commands[-1]["status"] != "OK" or commands[-1]["raw"] != ["PONG"]:
-                raise DDTError("DOSBox-X debugger did not answer PING with PONG")
-            if settle > 0:
-                time.sleep(settle)
-            commands.append(_request(conn, 2, "BREAK", command_timeout))
-            if commands[-1]["status"] != "OK":
-                raise DDTError(f"BREAK was refused: {commands[-1]['raw']}")
-            commands.append(_request(conn, 3, "EXEC EV " + " ".join(REGISTERS), command_timeout))
-            if commands[-1]["status"] != "OK":
-                raise DDTError(f"register query was refused: {commands[-1]['raw']}")
-            registers = _parse_registers(commands[-1]["raw"])
-            commands.append(_request(conn, 4, "EXEC CPU", command_timeout))
-            if commands[-1]["status"] != "OK":
-                raise DDTError(f"CPU status query was refused: {commands[-1]['raw']}")
-            cpu_status = commands[-1]["raw"]
-            # Leave the emulator running rather than parked in the debugger.
             try:
-                run = _request(conn, 5, "EXEC RUN", command_timeout)
-            except DDTError:
-                run = None
-            if run is not None:
-                commands.append(run)
-            resumed = run is not None and run["status"] == "OK"
+                if not _loopback(peer[0]):
+                    raise DDTError(f"refused non-loopback debugger connection from {peer[0]}")
+                commands.append(_request(conn, 1, "PING", command_timeout))
+                if commands[-1]["status"] != "OK" or commands[-1]["raw"] != ["PONG"]:
+                    raise DDTError("DOSBox-X debugger did not answer PING with PONG")
+                if settle > 0:
+                    time.sleep(settle)
+                commands.append(_request(conn, 2, "BREAK", command_timeout))
+                if commands[-1]["status"] != "OK":
+                    raise DDTError(f"BREAK was refused: {commands[-1]['raw']}")
+                broke = True
+                commands.append(_request(conn, 3, "EXEC EV " + " ".join(REGISTERS), command_timeout))
+                if commands[-1]["status"] != "OK":
+                    raise DDTError(f"register query was refused: {commands[-1]['raw']}")
+                registers = _parse_registers(commands[-1]["raw"])
+                commands.append(_request(conn, 4, "EXEC CPU", command_timeout))
+                if commands[-1]["status"] != "OK":
+                    raise DDTError(f"CPU status query was refused: {commands[-1]['raw']}")
+                cpu_status = commands[-1]["raw"]
+            except DDTError as exc:
+                failure = exc
+            finally:
+                # Recovery: do not leave an emulator we paused parked in the debugger.
+                if broke and not leave_paused:
+                    try:
+                        run = _request(conn, 5, "EXEC RUN", command_timeout)
+                    except DDTError as exc:
+                        recovery_error = str(exc)
+                    else:
+                        commands.append(run)
+                        resumed = run["status"] == "OK"
         finally:
             conn.close()
     finally:
         server.close()
+    if failure is not None:
+        message = str(failure)
+        if recovery_error is not None:
+            message += f"; the debugger resume also failed: {recovery_error}"
+        raise DDTError(message) from failure
 
     cs_ip = f"{registers['CS']}:{registers['IP']}" if registers else None
     unknown = ["DOSBox-X build identity (not queried over the protocol)"] if not dosbox_version else []
     if registers is None:
         unknown.append("individual register values (register response was not parseable)")
+    if not resumed and not leave_paused:
+        unknown.append("whether emulation resumed (the RUN acknowledgement was not received)")
     record = {
         "schema": SCHEMA,
         "endpoint": {"host": "127.0.0.1", "port": port},
@@ -173,13 +194,15 @@ def capture_cpu(port: int = DEFAULT_PORT, *, settle: float = 3.0, timeout: float
         "dosbox_version": dosbox_version,
         "paused_at_capture": True,
         "resumed": resumed,
+        "left_paused": leave_paused,
         "commands": commands,
         "registers": registers,
         "register_order": list(REGISTERS) if registers else None,
         "cs_ip": cs_ip,
         "cpu_status_text": cpu_status,
         "observed": ["PING/PONG handshake", "BREAK", "registers from EXEC EV",
-                     "CPU status from EXEC CPU"],
+                     "CPU status from EXEC CPU"]
+                    + ([] if leave_paused else ["resume requested (RUN acknowledgement recorded)"]),
         "unknown": unknown,
         "limits": list(_LIMITS),
     }

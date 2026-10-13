@@ -45,6 +45,7 @@ class _FakeDOSBox(threading.Thread):
         super().__init__(daemon=True)
         self.port, self.responses, self.force_id = port, responses, force_id
         self.close_after, self.ready = close_after, ready
+        self.seen: list[str] = []
 
     def run(self):
         deadline = time.time() + 3.0
@@ -73,6 +74,7 @@ class _FakeDOSBox(threading.Thread):
                     raw, buffer = buffer.split(b"\n", 1)
                     parts = raw.decode().split(" ", 2)
                     rid, command = parts[1], parts[2]
+                    self.seen.append(command)
                     handled += 1
                     if self.close_after is not None and handled > self.close_after:
                         return
@@ -100,12 +102,12 @@ def _capture(port, responses=_default_responses, force_id=None, close_after=None
     peer.start()
     worker.join(timeout=15)
     peer.join(timeout=5)
-    return result.get("record"), errors.get("error")
+    return result.get("record"), errors.get("error"), peer
 
 
 def test_capture_parses_registers_and_cpu_state():
     port = _free_port()
-    record, error = _capture(port)
+    record, error, _ = _capture(port)
     assert error is None
     assert record["schema"] == "ddt.dosbox-cpu.v1"
     assert record["endpoint"] == {"host": "127.0.0.1", "port": port}
@@ -129,14 +131,14 @@ def test_capture_reports_script_error_status():
         return ("ERR", ["*** Debugger command not recognized"]) if command == "EXEC CPU" \
             else _default_responses(command)
 
-    record, error = _capture(port, responses)
+    record, error, _ = _capture(port, responses)
     assert record is None
     assert isinstance(error, DDTError) and "refused" in str(error)
 
 
 def test_capture_rejects_mismatched_request_id():
     port = _free_port()
-    record, error = _capture(port, force_id="99")
+    record, error, _ = _capture(port, force_id="99")
     assert record is None
     assert isinstance(error, DDTError) and "unexpected response header" in str(error)
 
@@ -151,7 +153,7 @@ def test_capture_times_out_without_a_connection():
 
 def test_capture_detects_closed_connection():
     port = _free_port()
-    record, error = _capture(port, close_after=1)
+    record, error, _ = _capture(port, close_after=1)
     assert record is None
     assert isinstance(error, DDTError) and "closed" in str(error)
 
@@ -166,7 +168,7 @@ def test_invalid_port_and_non_loopback_guard(tmp_path):
 def test_capture_writes_receipt_outside_dosbox(tmp_path):
     port = _free_port()
     out = tmp_path / "cpu.json"
-    record, error = _capture(port, out=out)
+    record, error, _ = _capture(port, out=out)
     assert error is None
     assert json.loads(out.read_text(encoding="utf-8")) == record
 
@@ -186,3 +188,55 @@ def test_cli_capture_cpu_with_socket_peer(tmp_path):
     # Missing subcommand is a clean CLI failure.
     bad = subprocess.run([sys.executable, "-m", "ddt", "debugger"], capture_output=True, text=True, env=env)
     assert bad.returncode == 2
+
+
+# --- Stage 1: pause/resume recovery ------------------------------------------
+
+def _failing_responses(failing: str, *, error=True):
+    def responses(command):
+        if error and (command == failing or command.startswith(failing)):
+            return "ERR", ["*** Debugger command not recognized"]
+        return _default_responses(command)
+    return responses
+
+
+def test_ev_failure_after_break_still_attempts_resume():
+    port = _free_port()
+    record, error, peer = _capture(port, _failing_responses("EXEC EV"))
+    assert record is None
+    assert "register query was refused" in str(error)
+    assert "resume also failed" not in str(error)
+    assert any(command.startswith("EXEC RUN") for command in peer.seen)
+
+
+def test_cpu_failure_after_break_still_attempts_resume():
+    port = _free_port()
+    record, error, peer = _capture(port, _failing_responses("EXEC CPU"))
+    assert record is None
+    assert "CPU status query was refused" in str(error)
+    assert any(command.startswith("EXEC RUN") for command in peer.seen)
+
+
+def test_original_error_preserved_when_recovery_also_fails():
+    port = _free_port()
+    record, error, _ = _capture(port, _failing_responses("EXEC EV"), close_after=3)
+    assert record is None
+    assert isinstance(error, DDTError)
+    text = str(error)
+    assert "register query was refused" in text and "resume also failed" in text
+
+
+def test_run_failure_is_reported_without_losing_the_capture():
+    port = _free_port()
+    record, error, _ = _capture(port, _failing_responses("EXEC RUN"))
+    assert error is None
+    assert record["resumed"] is False and record["left_paused"] is False
+    assert any("resumed" in entry for entry in record["unknown"])
+
+
+def test_leave_paused_skips_resume():
+    port = _free_port()
+    record, error, peer = _capture(port, leave_paused=True)
+    assert error is None
+    assert record["left_paused"] is True and record["resumed"] is False
+    assert not any(command.startswith("EXEC RUN") for command in peer.seen)

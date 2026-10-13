@@ -70,6 +70,8 @@ def main(argv: list[str] | None = None) -> int:
     dc.add_argument("--settle", type=float, default=3.0, help="Seconds to wait after connect before BREAK")
     dc.add_argument("--timeout", type=float, default=60.0, help="Seconds to wait for the connection")
     dc.add_argument("--dosbox-version", default=None, help="Record an operator-known DOSBox-X version")
+    dc.add_argument("--leave-paused", action="store_true",
+                    help="Leave the debugger paused instead of resuming the emulator")
     dc.add_argument("--json", action="store_true")
     gh = commands.add_parser("ghidra", help="Optional read-only Ghidra integration")
     gh_sub = gh.add_subparsers(dest="ghidra_command", required=True)
@@ -112,7 +114,8 @@ def main(argv: list[str] | None = None) -> int:
                             max_runs=args.max_runs)
         elif args.command == "debugger":
             output = capture_cpu(args.port, settle=args.settle, timeout=args.timeout,
-                                 dosbox_version=args.dosbox_version, out=args.out)
+                                 dosbox_version=args.dosbox_version, out=args.out,
+                                 leave_paused=args.leave_paused)
         elif args.command == "ghidra":
             output = export_function(args.project, args.program, args.function, args.out,
                                      ghidra=args.ghidra, java_home=args.java_home, timeout=args.timeout)
