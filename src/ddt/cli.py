@@ -10,6 +10,7 @@ from . import __version__
 from .diff import compare, manifest
 from .errors import DDTError
 from .format import inspect, map_address
+from .ghidra import export_function
 from .strings import extract
 
 
@@ -44,6 +45,17 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--min-length", type=int, default=4)
     st.add_argument("--max-results", type=int, default=4096)
     st.add_argument("--json", action="store_true")
+    gh = commands.add_parser("ghidra", help="Optional read-only Ghidra integration")
+    gh_sub = gh.add_subparsers(dest="ghidra_command", required=True)
+    gx = gh_sub.add_parser("export", help="Export one analyzed function from an existing Ghidra project")
+    gx.add_argument("--project", required=True, type=Path, help="Ghidra .gpr file or its directory")
+    gx.add_argument("--program", required=True, help="Program name inside the project")
+    gx.add_argument("--function", required=True, help="Ghidra entry address, e.g. 0x1000 or 1000:0000")
+    gx.add_argument("--out", required=True, type=Path, help="Destination JSON file")
+    gx.add_argument("--ghidra", type=Path, default=None, help="Ghidra install directory or analyzeHeadless launcher")
+    gx.add_argument("--java-home", type=Path, default=None, help="JAVA_HOME for the Ghidra launcher")
+    gx.add_argument("--timeout", type=int, default=600)
+    gx.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "inspect":
@@ -54,6 +66,9 @@ def main(argv: list[str] | None = None) -> int:
             output = compare(args.before, args.after, args.max_runs)
         elif args.command == "strings":
             output = extract(args.path, args.min_length, args.max_results)
+        elif args.command == "ghidra":
+            output = export_function(args.project, args.program, args.function, args.out,
+                                     ghidra=args.ghidra, java_home=args.java_home, timeout=args.timeout)
         else:
             output = manifest(args.path)
         print(json.dumps(output, indent=2, sort_keys=True))
