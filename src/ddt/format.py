@@ -24,6 +24,18 @@ def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _secondary_header(data: bytes) -> tuple[str, int] | None:
+    """Return (kind, file_offset) of a recognised secondary executable header."""
+    if len(data) < 64 or data[:2] not in (b"MZ", b"ZM"):
+        return None
+    offset = struct.unpack_from("<I", data, 0x3C)[0]
+    if 64 <= offset <= len(data) - 2 and data[offset:offset + 2] in (b"NE", b"LE", b"LX"):
+        return data[offset:offset + 2].decode("ascii").lower(), offset
+    if 64 <= offset <= len(data) - 4 and data[offset:offset + 4] == b"PE\x00\x00":
+        return "pe", offset
+    return None
+
+
 @dataclass(frozen=True)
 class MZ:
     source_size: int
@@ -92,22 +104,10 @@ class COM:
         return offset - 0x100
 
 
-def inspect(path: Path, fmt: str = "auto") -> MZ | COM:
-    data = _read_input(path)
-    if fmt not in ("auto", "mz", "com"):
-        raise DDTError("unknown format selection")
-    if fmt == "com":
-        if not 1 <= len(data) <= MAX_COM_SIZE:
-            raise DDTError("COM image must contain 1..65280 bytes")
-        return COM(len(data), _digest(data))
+def parse_mz(data: bytes) -> MZ:
+    """Validate and parse a DOS MZ image; raise DDTError when it is not a clean MZ."""
     if len(data) < 28 or data[:2] not in (b"MZ", b"ZM"):
         raise DDTError("MZ header missing; select --format com explicitly for COM images")
-    if len(data) >= 64:
-        candidate = struct.unpack_from("<I", data, 0x3c)[0]
-        if 64 <= candidate <= len(data) - 2 and data[candidate:candidate + 2] in (b"NE", b"LE", b"LX"):
-            raise DDTError("NE/LE/LX executable, not supported as a real-mode DOS MZ target")
-        if 64 <= candidate <= len(data) - 4 and data[candidate:candidate + 4] == b"PE\x00\x00":
-            raise DDTError("PE executable, not supported as a real-mode DOS MZ target")
     fields = struct.unpack_from("<14H", data)
     (_, last_page, pages, reloc_count, paras, minalloc, maxalloc,
      ss, sp, _checksum, ip, cs, rel_off, _overlay_no) = fields
@@ -123,6 +123,22 @@ def inspect(path: Path, fmt: str = "auto") -> MZ | COM:
     return MZ(len(data), _digest(data), header, declared, declared - header,
               len(data) - declared, cs, ip, ss, sp, minalloc, maxalloc,
               rel_off, relocations)
+
+
+def inspect(path: Path, fmt: str = "auto") -> MZ | COM:
+    data = _read_input(path)
+    if fmt not in ("auto", "mz", "com"):
+        raise DDTError("unknown format selection")
+    if fmt == "com":
+        if not 1 <= len(data) <= MAX_COM_SIZE:
+            raise DDTError("COM image must contain 1..65280 bytes")
+        return COM(len(data), _digest(data))
+    secondary = _secondary_header(data)
+    if secondary is not None:
+        kind, _ = secondary
+        raise DDTError("PE executable, not supported as a real-mode DOS MZ target" if kind == "pe"
+                       else "NE/LE/LX executable, not supported as a real-mode DOS MZ target")
+    return parse_mz(data)
 
 
 def map_address(target: MZ | COM, segment: int, offset: int) -> dict:

@@ -12,6 +12,7 @@ from .diff import compare, manifest
 from .errors import DDTError
 from .format import inspect, map_address
 from .ghidra import export_function
+from .identify import identify
 from .strings import extract
 
 
@@ -46,6 +47,10 @@ def main(argv: list[str] | None = None) -> int:
     st.add_argument("--min-length", type=int, default=4)
     st.add_argument("--max-results", type=int, default=4096)
     st.add_argument("--json", action="store_true")
+    idn = commands.add_parser("identify", help="Identify DOS containers and packaging markers")
+    idn.add_argument("path", type=Path)
+    idn.add_argument("--format", choices=["auto", "mz", "com"], default="auto")
+    idn.add_argument("--json", action="store_true")
     gh = commands.add_parser("ghidra", help="Optional read-only Ghidra integration")
     gh_sub = gh.add_subparsers(dest="ghidra_command", required=True)
     gx = gh_sub.add_parser("export", help="Export one analyzed function from an existing Ghidra project")
@@ -74,6 +79,8 @@ def main(argv: list[str] | None = None) -> int:
             output = compare(args.before, args.after, args.max_runs)
         elif args.command == "strings":
             output = extract(args.path, args.min_length, args.max_results)
+        elif args.command == "identify":
+            output = identify(args.path, args.format)
         elif args.command == "ghidra":
             output = export_function(args.project, args.program, args.function, args.out,
                                      ghidra=args.ghidra, java_home=args.java_home, timeout=args.timeout)

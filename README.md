@@ -6,6 +6,7 @@ A small, read-only, cross-platform toolkit for examining 16-bit DOS executables.
 
 - DOS MZ executables: header, relocation table and overlay are validated; NE, LE, LX and PE binaries are rejected rather than treated as DOS MZ payloads.
 - Headerless COM images, selected explicitly with `--format com`.
+- Other containers (NE/LE/LX/PE stubs, embedded COFF, common packers) are only **identified** by `ddt identify`; they are not loaded or analyzed.
 - Arbitrary files and directories for hashing and byte-level comparison.
 
 ## Implemented now
@@ -18,6 +19,7 @@ A small, read-only, cross-platform toolkit for examining 16-bit DOS executables.
 - Printable-string extraction with exact original file offsets
 - Read-only export of one analyzed function from an existing Ghidra project (optional; Ghidra is not needed for any other command)
 - Offline direct caller/callee navigation over an exported function (no Ghidra required)
+- Read-only identification of DOS containers, embedded signatures and packaging markers
 - Versioned JSON output and a nonzero exit code on invalid input
 - Native Linux and Windows packaging workflow using native runners
 
@@ -36,6 +38,7 @@ ddt address GAME.EXE --segment 0x1234 --offset 0x100 --json
 ddt diff before/ after/ --json
 ddt manifest before/ --json
 ddt strings GAME.EXE --json
+ddt identify PROGRAM.EXE --json
 ddt ghidra export --project ./proj --program GAME.EXE --function 1000:0000 --out func.json --json
 ddt code callers --export func.json --json
 ddt code callees --export func.json --json
@@ -57,6 +60,17 @@ Limitations: instruction bytes are read from the loaded program image and may di
 `ddt code callers --export func.json` and `ddt code callees --export func.json` answer direct relationship questions from an existing export, with no Ghidra run and no re-reading of the executable. Callers reports call references that target the function entry, separating direct, computed/indirect, and externally resolved ones; callees does the same for outgoing calls, plus unresolved (indirect) calls. Both output a compact versioned record (`ddt.code-callers.v2` / `ddt.code-callees.v1`).
 
 These are deliberately bounded: a single exported function does not describe the whole program, incoming references cover the entry point only, caller function names are unavailable, indirect or aliased calls may be unresolved, and the export's own limits may truncate reference collections (the response reports truncation, marking it unknown for older exports). Direct call targets are call-site addresses, not verified function entry points.
+
+## Format identification (identification-only)
+
+`ddt identify PROGRAM.EXE` reports what a file structurally is, without loading, unpacking, relocating or executing anything. It reuses the validated MZ parser for the outer container (header size, declared length, appended region) and adds:
+
+- **Recognized and unsupported**: secondary `NE`/`LE`/`LX`/`PE` headers reached through the MZ `e_lfanew` pointer (`identified`, `supported: false`), reported with their file offset and container relationship. LE/LX are not assumed to be any particular DOS extender.
+- **Candidates**: `LZEXE` (`LZ09`/`LZ91` at the fixed 32-byte-header signature offset) and `UPX` (marker at file offset 85). A matching marker is a `candidate`, never proof of packing.
+- **Embedded i386 COFF**: reported only when a bounds-validated COFF file header and section table are present at the start of the file or at the MZ declared-image end; the loader identity stays `unknown` (it is not claimed to be DJGPP).
+- **Appended data**: bytes past the MZ declared image are reported as a region with `purpose: unknown` unless a recognized structure begins exactly there; appended bytes are never equated with code.
+
+Each finding carries a `classification` of `identified`, `candidate` or `unknown`, plus the exact basis. Not yet recognized: `PKLITE` and `EXEPACK` (no reliably anchored, independently verifiable signature), and DJGPP/GO32 identity beyond a candidate `go32stub` marker. `ddt inspect` and `ddt address` keep their existing MZ/COM behavior.
 
 ## Distribution builds
 
