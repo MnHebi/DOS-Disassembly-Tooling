@@ -174,6 +174,7 @@ public class ExportFunction extends GhidraScript {
         List<Object> unresolved = new ArrayList<>();
         int totalInstructions = 0;
         int totalOutgoing = 0;
+        int totalUnresolved = 0;
         InstructionIterator iterator = currentProgram.getListing().getInstructions(body, true);
         while (iterator.hasNext()) {
             Instruction instruction = iterator.next();
@@ -194,12 +195,15 @@ public class ExportFunction extends GhidraScript {
                 }
             }
             FlowType flow = instruction.getFlowType();
-            if ((flow.isCall() || flow.isJump()) && !resolvedFlow && unresolved.size() < MAX_REFERENCES) {
-                Map<String, Object> entry = new LinkedHashMap<>();
-                entry.put("address", addressString(instruction.getAddress()));
-                entry.put("text", instruction.toString());
-                entry.put("flow_type", flow.toString());
-                unresolved.add(entry);
+            if ((flow.isCall() || flow.isJump()) && !resolvedFlow) {
+                totalUnresolved++;
+                if (unresolved.size() < MAX_REFERENCES) {
+                    Map<String, Object> entry = new LinkedHashMap<>();
+                    entry.put("address", addressString(instruction.getAddress()));
+                    entry.put("text", instruction.toString());
+                    entry.put("flow_type", flow.toString());
+                    unresolved.add(entry);
+                }
             }
             if (instructions.size() < MAX_INSTRUCTIONS) {
                 instructions.add(instructionInfo(instruction, resolvedFlow));
@@ -211,14 +215,23 @@ public class ExportFunction extends GhidraScript {
         info.put("outgoing_reference_count", totalOutgoing);
         info.put("outgoing_references_truncated", totalOutgoing > outgoing.size());
         info.put("outgoing_references", outgoing);
+        info.put("unresolved_flow_count", totalUnresolved);
+        info.put("unresolved_flow_truncated", totalUnresolved > unresolved.size());
         info.put("unresolved_flow", unresolved);
 
         List<Object> incoming = new ArrayList<>();
+        int totalIncoming = 0;
         ReferenceIterator incomingIterator = currentProgram.getReferenceManager()
                 .getReferencesTo(function.getEntryPoint());
-        while (incomingIterator.hasNext() && incoming.size() < MAX_REFERENCES) {
-            incoming.add(referenceInfo(incomingIterator.next()));
+        while (incomingIterator.hasNext()) {
+            Reference reference = incomingIterator.next();
+            totalIncoming++;
+            if (incoming.size() < MAX_REFERENCES) {
+                incoming.add(referenceInfo(reference));
+            }
         }
+        info.put("incoming_reference_count", totalIncoming);
+        info.put("incoming_references_truncated", totalIncoming > incoming.size());
         info.put("incoming_references", incoming);
         return info;
     }

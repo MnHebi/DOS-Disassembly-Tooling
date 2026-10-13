@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 
 from . import __version__
+from .code import callees, callers
 from .diff import compare, manifest
 from .errors import DDTError
 from .format import inspect, map_address
@@ -56,6 +57,13 @@ def main(argv: list[str] | None = None) -> int:
     gx.add_argument("--java-home", type=Path, default=None, help="JAVA_HOME for the Ghidra launcher")
     gx.add_argument("--timeout", type=int, default=600)
     gx.add_argument("--json", action="store_true")
+    code = commands.add_parser("code", help="Query direct function relationships from an exported function")
+    code_sub = code.add_subparsers(dest="code_command", required=True)
+    for direction, help_text in (("callers", "Direct call references targeting the function entry"),
+                                 ("callees", "Direct calls made by the function")):
+        sub = code_sub.add_parser(direction, help=help_text)
+        sub.add_argument("--export", required=True, type=Path, help="Exported ddt.ghidra-function.v1 JSON")
+        sub.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "inspect":
@@ -69,6 +77,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "ghidra":
             output = export_function(args.project, args.program, args.function, args.out,
                                      ghidra=args.ghidra, java_home=args.java_home, timeout=args.timeout)
+        elif args.command == "code":
+            output = callers(args.export) if args.code_command == "callers" else callees(args.export)
         else:
             output = manifest(args.path)
         print(json.dumps(output, indent=2, sort_keys=True))

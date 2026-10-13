@@ -8,7 +8,7 @@ import sys
 
 import pytest
 
-from ddt import ghidra
+from ddt import code, ghidra
 from ddt.errors import DDTError
 
 
@@ -249,3 +249,14 @@ def test_integration_export_matches_fixture(tmp_path):
     assert any(u["text"] == "INT 0x21" for u in function["unresolved_flow"])
     block = next(b for b in program["memory_blocks"] if b["name"] == "CODE_0")
     assert block["sources"][0]["file_offset"] == 64
+    # Offline navigation over the real export must recover the known call edge.
+    ghidra.export_function(projects, "fixture.exe", "1000:000c",
+                           tmp_path / "callee.json", ghidra=home)
+    entry_callees = code.callees(tmp_path / "entry.json")
+    assert [c["to"] for c in entry_callees["direct_calls"]] == ["1000:000c"]
+    assert entry_callees["direct_calls"][0]["computed"] is False
+    assert any(c["text"] == "INT 0x21" for c in entry_callees["unresolved_calls"])
+    assert entry_callees["references_truncated"] is False
+    assert code.callers(tmp_path / "entry.json")["callers"] == []
+    callee_callers = code.callers(tmp_path / "callee.json")["callers"]
+    assert [(c["from"], c["to"]) for c in callee_callers] == [("1000:0000", "1000:000c")]

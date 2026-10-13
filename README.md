@@ -17,12 +17,13 @@ A small, read-only, cross-platform toolkit for examining 16-bit DOS executables.
 - Binary file and directory comparison with exact differing spans, bounded hexadecimal previews and exact run counts
 - Printable-string extraction with exact original file offsets
 - Read-only export of one analyzed function from an existing Ghidra project (optional; Ghidra is not needed for any other command)
+- Offline direct caller/callee navigation over an exported function (no Ghidra required)
 - Versioned JSON output and a nonzero exit code on invalid input
 - Native Linux and Windows packaging workflow using native runners
 
 ## Planned (not yet implemented)
 
-- Segmented code navigation (writers, readers, callers) that reports unresolved edges instead of guessing
+- Recursive call graphs and writers/readers/slice queries (only direct callers and callees exist today)
 - Optional capture intake and evidence indexing with hashes and provenance
 
 ## Installation and usage
@@ -36,6 +37,8 @@ ddt diff before/ after/ --json
 ddt manifest before/ --json
 ddt strings GAME.EXE --json
 ddt ghidra export --project ./proj --program GAME.EXE --function 1000:0000 --out func.json --json
+ddt code callers --export func.json --json
+ddt code callees --export func.json --json
 python -m pytest -q
 ```
 
@@ -48,6 +51,12 @@ See [docs/BLUEPRINT.md](docs/BLUEPRINT.md) for the design and roadmap.
 Point it at a Ghidra install with `--ghidra <dir>` (or the `GHIDRA_HOME` environment variable); `--java-home` selects a JDK if one is not already configured. Select the project with `--project <dir-or-.gpr>`, the program with `--program <name>`, and the function by its Ghidra entry address (`--function 1000:0000`). The versioned JSON record (`ddt.ghidra-function.v1`) reports program identity, language and image base, segmented memory blocks with import source mapping, the function's body ranges and instructions, and direct incoming/outgoing references with resolved/computed/unknown marked explicitly.
 
 Limitations: instruction bytes are read from the loaded program image and may differ from original file bytes where a loader applied relocations; original file offsets are included only where Ghidra recorded an import source mapping, and otherwise reported as unknown. Incoming references are reported for the function entry only, computed or indirect control transfers are listed as unresolved rather than resolved, and nothing outside the selected function is exported.
+
+## Function navigation (offline)
+
+`ddt code callers --export func.json` and `ddt code callees --export func.json` answer direct relationship questions from an existing export, with no Ghidra run and no re-reading of the executable. Callers reports the direct call references that target the function entry; callees separates proven direct calls from computed/indirect calls, externally resolved calls, and unresolved (indirect) calls. Both output a compact versioned record (`ddt.code-callers.v1` / `ddt.code-callees.v1`).
+
+These are deliberately bounded: a single exported function does not describe the whole program, incoming references cover the entry point only, caller function names are unavailable, indirect or aliased calls may be unresolved, and the export's own limits may truncate reference collections (the response reports truncation, marking it unknown for older exports). Direct call targets are call-site addresses, not verified function entry points.
 
 ## Distribution builds
 
