@@ -122,7 +122,9 @@ Captured values are DOSBox-X runtime observations, not Ghidra addresses, module 
 
 `ddt memory compare --correlation correlation.json --observation memory.json --binary PROGRAM.COM` compares three byte sources for one instruction: the **original executable**, **Ghidra's recorded memory bytes** (from the correlation's instruction), and the **DOSBox-X observed runtime bytes**. It requires the binary's SHA-256 to match the correlation, the observation to cover exactly the correlation's derived address and length (segment aliases are rejected, not treated as equivalent), and valid hex of the expected length; for MZ it also reports any relocation word overlapping the instruction extent. The result (`ddt.memory-comparison.v1`) reports `runtime_equals_original`, `runtime_equals_ghidra` and `ghidra_equals_original`, a bounded list of differing byte positions, and explicit uncertainty — **evidence, never an inferred cause** (relocations, loader activity or runtime modification can all explain a difference).
 
-`ddt debugger capture-step-memory --segment 0x0813 --offset 0x0200 --length 16` reads a bounded RAM region, executes **exactly one** DOS instruction, reads the identical region again and reports `ddt.dosbox-step-memory.v1`: the before/after bytes, each changed byte (`relative_offset`, `address`, `before`, `after`), the register differences, the synchronous STEPIN response and the raw exchanges. It needs a debugger-enabled build advertising **both** `MEMREAD` and `STEPIN` (the two experimental capabilities) and a debugger already stopped at the intended instruction — start the program with `DEBUGBOX`; DDT never launches the program, sets breakpoints or resumes execution. `--segment`/`--offset`/`--length` are the **region to observe**, an explicit runtime address rather than an instruction address: supply it from the observed registers (for a `DS`-relative instruction, use the observed `DS`), because DDT does not assume the region belongs to `CS`, `DS` or `SS`. Everything happens on one connection as a fixed sequence (capability check → registers → read → registers → one `STEPIN` → registers → read → registers) and execution is left stopped.
+`ddt debugger capture-step-memory --segment 0x0813 --offset 0x0200 --length 16` reads a bounded RAM region, executes **exactly one** DOS instruction, reads the identical region again and reports `ddt.dosbox-step-memory.v2`: the before/after bytes, each changed byte (`relative_offset`, `address`, `before`, `after`), the register differences, the synchronous STEPIN response and the raw exchanges. It needs a debugger-enabled build advertising **both** `MEMREAD` and `STEPIN` (the two experimental capabilities) and a debugger already stopped at the intended instruction — start the program with `DEBUGBOX`; DDT never launches the program, sets breakpoints or resumes execution. `--segment`/`--offset`/`--length` are the **region to observe**, an explicit runtime address rather than an instruction address: supply it from the observed registers (for a `DS`-relative instruction, use the observed `DS`), because DDT does not assume the region belongs to `CS`, `DS` or `SS`. Everything happens on one connection as a fixed sequence (capability check → registers → read → registers → one `STEPIN` → registers → read → registers).
+
+The record states what is actually established and no more: `resume_requested` is `false` (no `RUN`/resume was issued), `stepin_acknowledged` records that `STEPIN` returned an acknowledged response, and `paused_state` stays `unknown` because the protocol has no stopped-state query — a stable CS:IP is a consistency observation, not proof that the debugger is internally stopped.
 
 The evidence rules are explicit in the record: a changed byte shows the observed RAM differed between the two reads, **not** that the stepped instruction was the only possible cause; zero changed bytes means no difference was seen *inside the selected region*, not that the instruction wrote nothing elsewhere; register observations cover only the registers DDT reads; and a stable CS:IP across the reads is a consistency check, not proof of the debugger's internal state. A failed read after the step is reported as *uncertain* — the guest instruction may already have executed, and DDT never retries, undoes or resumes it.
 
@@ -133,3 +135,27 @@ GitHub Actions `.github/workflows/build.yml` runs the tests and produces PyInsta
 ## Safety and limits
 
 The tools never modify original files, do not infer runtime behavior from static layout, and never claim that an MZ load-module offset is an observed runtime segment:offset address. COM files are headerless and must be requested explicitly. The per-file processing limit is 64 MiB. No proprietary binaries or save files are included.
+
+**Read-only guarantees versus runtime effects.** DDT never modifies original executables, and never writes to saved Ghidra analysis projects — inspection, identification, diff/manifest and comparison commands are read-only, as are `MEMREAD`/`capture-memory` (they observe guest RAM without writing anything). Runtime stepping is the deliberate exception: `STEPIN`/`capture-steps`/`capture-step-memory` **execute guest instructions and therefore change guest runtime state**. DDT never writes guest memory, guest-drive files or host files through the debugger, and never issues `RUN`, `BREAK` or a resume of its own accord.
+
+## Project direction: DOS format support
+
+DDT's long-term goal is to explain **executable structures and the runtime evidence that can be tied back to them** across several DOS formats and execution environments. Support is added incrementally, and only for formats backed by real, independently verified fixtures — never from a specification alone.
+
+**Supported today**
+
+- Headerless **COM**: inspection, explicit original-file offsets, runtime address correlation (verified end-to-end).
+- Conventional real-mode DOS **MZ**: header/relocation/overlay inspection, source-offset mapping, runtime correlation (verified end-to-end).
+- **Runtime observation** (optional, debugger-enabled DOSBox-X builds): bounded conventional-RAM reads, single-instruction stepping, one-instruction memory-change observation, and single-breakpoint capture — within the supported real-mode debugger environment.
+- **Other containers** (NE/LE/LX/PE, embedded COFF, packer markers): conservative **identification only**; DDT never claims to load or analyze them.
+
+**Planned investigation areas** — explicitly *not* implemented:
+
+- Packed COM/MZ executables (packer identity, stub entry, unpacking handoff).
+- Overlay-based DOS programs.
+- DOS extenders and protected-mode executables, and the LE/LX containers they use.
+- Any further format, when a real example justifies the work.
+
+Each format advances through the same incremental stages — **identification → structural parsing → byte extraction → address mapping → runtime correlation** — and not every format needs every stage immediately. Nothing in the list above is implemented until a command exists and has been verified against a genuine fixture.
+
+**Architecture principle.** Keep the evidence-processing core (hashing, manifests, bounded byte comparison, memory/correlation records) format-independent wherever that is genuinely possible, and let format-specific code supply only the structure and mapping facts needed to interpret a file. Never assume that bytes in a packed or compressed executable map directly to the instructions produced after decompression: a runtime instruction may correspond to the original program while having **no direct source-file offset in the packed file**. No plugin architecture is introduced before real implementations justify it.
