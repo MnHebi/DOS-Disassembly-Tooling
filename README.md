@@ -15,6 +15,7 @@ A small, read-only, cross-platform toolkit for examining 16-bit DOS executables.
 - File-offset mapping for **module-relative** segment:offset coordinates, kept distinct from unknown runtime segments
 - File and directory SHA-256 manifests
 - Binary file and directory comparison with exact differing spans, bounded hexadecimal previews and exact run counts
+- Printable-string extraction with exact original file offsets
 - Versioned JSON output and a nonzero exit code on invalid input
 - Native Linux and Windows packaging workflow using native runners
 
@@ -33,6 +34,7 @@ ddt inspect GAME.COM --format com --json
 ddt address GAME.EXE --segment 0x1234 --offset 0x100 --json
 ddt diff before/ after/ --json
 ddt manifest before/ --json
+ddt strings GAME.EXE --json
 python -m pytest -q
 ```
 

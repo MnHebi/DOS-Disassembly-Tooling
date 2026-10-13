@@ -29,3 +29,13 @@ def test_cli_rejects_unsupported(tmp_path):
                           capture_output=True, text=True, env=_dev_env())
     assert proc.returncode == 2
     assert json.loads(proc.stderr)["error_type"] == "DDTError"
+
+
+def test_cli_strings(tmp_path):
+    target = tmp_path / "sample.bin"
+    target.write_bytes(b"\x00Copyright 1995 Example Corp\x00")
+    proc = subprocess.run([sys.executable, "-m", "ddt", "strings", str(target), "--json"],
+                          check=True, capture_output=True, text=True, env=_dev_env())
+    record = json.loads(proc.stdout)
+    assert record["strings"][0]["text"] == "Copyright 1995 Example Corp"
+    assert record["strings"][0]["file_offset"] == 1

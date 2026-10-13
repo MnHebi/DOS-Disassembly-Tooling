@@ -10,6 +10,7 @@ from . import __version__
 from .diff import compare, manifest
 from .errors import DDTError
 from .format import inspect, map_address
+from .strings import extract
 
 
 def _num(s: str) -> int:
@@ -38,6 +39,11 @@ def main(argv: list[str] | None = None) -> int:
     man = commands.add_parser("manifest", help="Deterministic hash inventory of file/directory")
     man.add_argument("path", type=Path)
     man.add_argument("--json", action="store_true")
+    st = commands.add_parser("strings", help="Extract printable strings with original file offsets")
+    st.add_argument("path", type=Path)
+    st.add_argument("--min-length", type=int, default=4)
+    st.add_argument("--max-results", type=int, default=4096)
+    st.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "inspect":
@@ -46,6 +52,8 @@ def main(argv: list[str] | None = None) -> int:
             output = map_address(inspect(args.path, args.format), args.segment, args.offset)
         elif args.command == "diff":
             output = compare(args.before, args.after, args.max_runs)
+        elif args.command == "strings":
+            output = extract(args.path, args.min_length, args.max_results)
         else:
             output = manifest(args.path)
         print(json.dumps(output, indent=2, sort_keys=True))
