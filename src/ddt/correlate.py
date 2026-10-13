@@ -8,12 +8,11 @@ entry context and is reported as conditional, never as verified execution.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
 from .errors import DDTError
-from .format import COM, MZ, _read_input, inspect
+from .format import COM, MZ, inspect
 
 SCHEMA = "ddt.address-correlation.v1"
 GHIDRA_SCHEMA = "ddt.ghidra-function.v1"
@@ -66,13 +65,13 @@ def correlate(binary: str | Path, fmt: str, export: str | Path, instruction: str
     if fmt not in ("com", "mz"):
         raise DDTError(f"format must be 'com' or 'mz': {fmt!r}")
     source = Path(binary)
-    data = _read_input(source)
+    # inspect() reads the executable once and returns both the digest and the size.
     target = inspect(source, fmt)
     if fmt == "com" and not isinstance(target, COM):
         raise DDTError("the selected binary is not a COM image")
     if fmt == "mz" and not isinstance(target, MZ):
         raise DDTError("the selected binary is not an MZ image")
-    local_sha = hashlib.sha256(data).hexdigest()
+    local_sha = target.sha256
 
     ghidra = _load_json(export, GHIDRA_SCHEMA, "Ghidra export")
     program = ghidra.get("program") or {}
@@ -96,6 +95,17 @@ def correlate(binary: str | Path, fmt: str, export: str | Path, instruction: str
     if chosen.get("source_file") and chosen["source_file"].lower() != source.name.lower():
         raise DDTError(f"instruction {instruction} maps to {chosen['source_file']!r}, not "
                        f"{source.name!r}; executable identity is unresolved")
+    length = chosen.get("length")
+    if not isinstance(file_offset, int) or isinstance(file_offset, bool) or file_offset < 0:
+        raise DDTError(f"instruction {instruction} has an invalid source file offset: {file_offset!r}")
+    if not isinstance(length, int) or isinstance(length, bool) or length <= 0:
+        raise DDTError(f"instruction {instruction} has an invalid instruction length: {length!r}")
+    reported_bytes = chosen.get("bytes")
+    if reported_bytes is not None and (not isinstance(reported_bytes, str)
+                                       or len(reported_bytes) != length * 2
+                                       or any(c not in "0123456789abcdefABCDEF" for c in reported_bytes)):
+        raise DDTError(f"instruction {instruction} reports {reported_bytes!r}, which is not "
+                       f"{length} bytes of hexadecimal")
 
     observation = _load_json(entry_observation, STEPS_SCHEMA, "entry observation")
     initial = observation.get("initial") or {}
@@ -115,16 +125,18 @@ def correlate(binary: str | Path, fmt: str, export: str | Path, instruction: str
         if entry_ip != 0x100:
             raise DDTError(f"COM entry must be observed at IP=0100, not {entry_ip:04X}; "
                            "the entry observation is not a COM program start")
-        if not 0 <= file_offset < target.source_size:
-            raise DDTError(f"source file offset {file_offset} is outside the COM image "
-                           f"(0..{target.source_size - 1})")
+        if file_offset + length > target.source_size:
+            raise DDTError(f"the instruction extent {file_offset}..{file_offset + length} is outside "
+                           f"the COM image (0..{target.source_size - 1})")
         runtime_offset = 0x100 + file_offset
         arithmetic = ["COM images load with file offset 0 at runtime offset 0100",
                       f"runtime offset = 0100 + {file_offset:04X} = {runtime_offset:04X}",
                       f"runtime segment = observed entry CS {entry_cs:04X}"]
         mapping.update({"runtime_segment": f"{entry_cs:04X}",
                         "runtime_offset": f"{runtime_offset:04X}",
-                        "runtime_cs_ip": f"{entry_cs:04X}:{runtime_offset:04X}"})
+                        "runtime_cs_ip": f"{entry_cs:04X}:{runtime_offset:04X}",
+                        "instruction_length": length,
+                        "instruction_extent": [file_offset, file_offset + length]})
         checks["entry_ip_is_0100"] = True
         checks["within_source_image"] = True
     else:
@@ -133,9 +145,9 @@ def correlate(binary: str | Path, fmt: str, export: str | Path, instruction: str
                            f"observation says {entry_ip:04X}")
         load_segment = (entry_cs - target.entry_cs) & 0xFFFF
         module_offset = file_offset - target.header_bytes
-        if not 0 <= module_offset < target.image_bytes:
-            raise DDTError(f"source file offset {file_offset} is outside the initialized MZ load "
-                           f"module ({target.header_bytes}.."
+        if module_offset < 0 or module_offset + length > target.image_bytes:
+            raise DDTError(f"the instruction extent {file_offset}..{file_offset + length} is outside "
+                           f"the initialized MZ load module ({target.header_bytes}.."
                            f"{target.header_bytes + target.image_bytes - 1})")
         physical = load_segment * 16 + module_offset
         if physical > 0xFFFFF:
@@ -151,14 +163,16 @@ def correlate(binary: str | Path, fmt: str, export: str | Path, instruction: str
         mapping.update({"module_image_offset": module_offset,
                         "load_segment": f"{load_segment:04X}",
                         "canonical_runtime_cs_ip": f"{physical >> 4:04X}:{physical & 0xF:04X}",
-                        "runtime_cs_ip": f"{(physical >> 4) & 0xFFFF:04X}:{physical & 0xF:04X}"})
+                        "runtime_cs_ip": f"{(physical >> 4) & 0xFFFF:04X}:{physical & 0xF:04X}",
+                        "instruction_length": length,
+                        "instruction_extent": [file_offset, file_offset + length]})
         checks.update({"entry_ip_matches_header": True, "within_initialized_image": True,
                        "no_address_wraparound": True})
 
     return {
         "schema": SCHEMA,
         "binary": {"path": str(source), "format": "dos-com" if fmt == "com" else "dos-mz",
-                   "sha256": local_sha, "size": len(data)},
+                   "sha256": local_sha, "size": target.source_size},
         "ghidra": {"program": program.get("name"), "executable_sha256": export_sha,
                    "identity_matches": True},
         "instruction": {"ghidra_address": instruction, "source_file": chosen.get("source_file"),

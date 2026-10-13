@@ -29,9 +29,10 @@ def _export(name: str, data: bytes, instructions: list[dict]) -> dict:
                          "instructions": instructions}}
 
 
-def _instruction(address: str, source_file: str, offset, *, known=True, text="MOV AX,0x1234"):
-    return {"address": address, "bytes": "b83412", "text": text, "source_file": source_file,
-            "source_file_offset": offset, "mapping_known": known}
+def _instruction(address: str, source_file: str, offset, *, known=True, text="MOV AX,0x1234",
+                 length=3, raw_bytes="b83412"):
+    return {"address": address, "bytes": raw_bytes, "length": length, "text": text,
+            "source_file": source_file, "source_file_offset": offset, "mapping_known": known}
 
 
 def _steps(cs_ip: str) -> dict:
@@ -180,3 +181,68 @@ def test_cli_correlate(tmp_path):
     payload = json.loads(proc.stdout)
     assert payload["schema"] == "ddt.address-correlation.v1"
     assert payload["mapping"]["runtime_cs_ip"] == "0813:0103"
+
+
+def test_binary_is_read_only_once(tmp_path, monkeypatch):
+    binary, export, steps = _com_case(tmp_path)
+    reads: list[Path] = []
+    original = Path.read_bytes
+
+    def counting(self):
+        if self == binary:
+            reads.append(self)
+        return original(self)
+
+    monkeypatch.setattr(Path, "read_bytes", counting)
+    record = correlate_mod.correlate(binary, "com", export, "1000:0103", steps)
+    assert record["mapping"]["runtime_cs_ip"] == "0813:0103"
+    assert len(reads) == 1
+
+
+def test_instruction_extent_boundaries_and_malformed_evidence(tmp_path):
+    binary, export, steps = _com_case(tmp_path)  # 8-byte COM
+    boundary = _write(tmp_path, "boundary.json",
+                      _export("loop.com", COM_BYTES,
+                              [_instruction("1000:0105", "loop.com", 5, raw_bytes="7856eb")]))
+    record = correlate_mod.correlate(binary, "com", boundary, "1000:0105", steps)
+    assert record["mapping"]["runtime_cs_ip"] == "0813:0105"
+    assert record["mapping"]["instruction_extent"] == [5, 8]
+    beyond = _write(tmp_path, "beyond.json",
+                    _export("loop.com", COM_BYTES,
+                            [_instruction("1000:0106", "loop.com", 6, raw_bytes="ebf890")]))
+    with pytest.raises(DDTError, match="outside the COM image"):
+        correlate_mod.correlate(binary, "com", beyond, "1000:0106", steps)
+    for value in (0, -1, None):
+        bad = _write(tmp_path, f"len-{value}.json",
+                     _export("loop.com", COM_BYTES,
+                             [{**_instruction("1000:0103", "loop.com", 3), "length": value}]))
+        with pytest.raises(DDTError, match="invalid instruction length"):
+            correlate_mod.correlate(binary, "com", bad, "1000:0103", steps)
+    bad_offset = _write(tmp_path, "neg-offset.json",
+                        _export("loop.com", COM_BYTES,
+                                [_instruction("1000:0103", "loop.com", -1)]))
+    with pytest.raises(DDTError, match="invalid source file offset"):
+        correlate_mod.correlate(binary, "com", bad_offset, "1000:0103", steps)
+    bad_bytes = _write(tmp_path, "bad-bytes.json",
+                       _export("loop.com", COM_BYTES,
+                               [_instruction("1000:0103", "loop.com", 3, length=2)]))
+    with pytest.raises(DDTError, match="not 2 bytes of hexadecimal"):
+        correlate_mod.correlate(binary, "com", bad_bytes, "1000:0103", steps)
+
+
+def test_mz_rejects_header_and_overlay_extents(tmp_path):
+    image = _mz_bytes() + b"OVERLAY!"
+    binary = _write(tmp_path, "fixture.exe", image)
+    steps = _write(tmp_path, "steps.json", _steps("0813:0000"))
+    in_header = _write(tmp_path, "header.json",
+                       _export("fixture.exe", image,
+                               [_instruction("1000:0000", "fixture.exe", 60,
+                                             length=4, raw_bytes="00000000")]))
+    with pytest.raises(DDTError, match="outside the initialized MZ load module"):
+        correlate_mod.correlate(binary, "mz", in_header, "1000:0000", steps)
+    in_overlay = _write(tmp_path, "overlay.json",
+                        _export("fixture.exe", image,
+                                [_instruction("1000:0000", "fixture.exe", 100,
+                                              length=2, raw_bytes="4f56")]))
+    with pytest.raises(DDTError, match="outside the initialized MZ load module"):
+        correlate_mod.correlate(binary, "mz", in_overlay, "1000:0000", steps)
