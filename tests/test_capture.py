@@ -46,6 +46,34 @@ def test_identical_captures(tmp_path):
                      "sha256": hashlib.sha256(b"\x01\x02\x03").hexdigest()}
 
 
+def test_each_capture_file_is_read_once_and_hashes_agree(tmp_path, monkeypatch):
+    before = _snapshot(tmp_path, "before", {"f.dat": b"ABCD", "sub/g.dat": b"gg", "gone.dat": b"x"})
+    after = _snapshot(tmp_path, "after", {"f.dat": b"AXCD", "sub/g.dat": b"gg", "new.dat": b"z"})
+    tracked = {before / name for name in ("f.dat", "sub/g.dat", "gone.dat")} \
+        | {after / name for name in ("f.dat", "sub/g.dat", "new.dat")}
+    reads: dict[Path, int] = {}
+    original = Path.read_bytes
+
+    def counting(path):
+        reads[path] = reads.get(path, 0) + 1
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", counting)
+    record = intake(before, after)
+    assert all(reads.get(path, 0) == 1 for path in tracked)
+    rows = {row["path"]: row for row in record["comparison"]["results"]}
+    for side in ("before", "after"):
+        manifest = record["captures"][side]["manifest"]
+        assert manifest["schema"] == "ddt.artifact-manifest.v1"
+        for entry in manifest["entries"]:
+            assert entry["sha256"] == rows[entry["path"]][f"{side}_sha256"]
+            assert entry["bytes"] == rows[entry["path"]][f"{side}_bytes"]
+    assert {e["path"] for e in record["captures"]["before"]["manifest"]["entries"]} \
+        == {"f.dat", "sub/g.dat", "gone.dat"}
+    assert {e["path"] for e in record["captures"]["after"]["manifest"]["entries"]} \
+        == {"f.dat", "sub/g.dat", "new.dat"}
+
+
 def test_single_changed_byte(tmp_path):
     before = _snapshot(tmp_path, "before", {"f.dat": b"ABCD"})
     after = _snapshot(tmp_path, "after", {"f.dat": b"AXCD"})

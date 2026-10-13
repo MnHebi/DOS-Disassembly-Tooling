@@ -12,10 +12,11 @@ from pathlib import Path
 import shutil
 import tempfile
 
-from .diff import compare, manifest
+from .diff import compare
 from .errors import DDTError
 
 SCHEMA = "ddt.capture-intake.v1"
+MANIFEST_SCHEMA = "ddt.artifact-manifest.v1"
 
 _LIMITS = [
     "A receipt records what DDT read; it does not prove the captures came from a "
@@ -23,6 +24,8 @@ _LIMITS = [
     "Differences are reported, not explained: no cause is attributed to any action",
     "Changed-byte previews are bounded; total run counts are preserved",
     "Neither capture directory nor its contents are modified",
+    "Both capture directories must be stable for the duration of intake; DDT does "
+    "not lock, snapshot, or watch the filesystem",
 ]
 
 
@@ -37,6 +40,14 @@ def _inside(candidate: Path, root: Path) -> bool:
     candidate = candidate.resolve()
     root = root.resolve()
     return candidate == root or root in candidate.parents
+
+
+def _manifest(results: list[dict], side: str) -> dict:
+    """Build a manifest from the comparison's own single observation of each file."""
+    return {"schema": MANIFEST_SCHEMA,
+            "entries": [{"path": row["path"], "bytes": row[f"{side}_bytes"],
+                         "sha256": row[f"{side}_sha256"]}
+                        for row in results if row[f"{side}_sha256"] is not None]}
 
 
 def _write_receipt(destination: Path, record: dict, before: Path, after: Path) -> None:
@@ -67,11 +78,12 @@ def intake(before: str | Path, after: str | Path, *, out: str | Path | None = No
         raise DDTError("max_runs must be nonnegative")
     comparison = compare(before_dir, after_dir, max_runs)
     summary = comparison["summary"]
+    results = comparison["results"]
     record = {
         "schema": SCHEMA,
         "captures": {
-            "before": {"path": str(before_dir), "manifest": manifest(before_dir)},
-            "after": {"path": str(after_dir), "manifest": manifest(after_dir)},
+            "before": {"path": str(before_dir), "manifest": _manifest(results, "before")},
+            "after": {"path": str(after_dir), "manifest": _manifest(results, "after")},
         },
         "comparison": comparison,
         "counts": {"added": summary["only_after"], "removed": summary["only_before"],
