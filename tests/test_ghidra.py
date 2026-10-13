@@ -83,16 +83,16 @@ def test_build_command_wraps_batch_launcher():
     assert command[command.index("-process") + 1] == "fixture.exe"
 
 
-def _run_export(tmp_path, monkeypatch, writer, home):
+def _run_export(tmp_path, monkeypatch, writer, home, returncode=0, destination=None):
     def fake_run(command, **kwargs):
         writer(Path(command[-1]))
-        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(command, returncode, stdout="simulated ghidra", stderr="")
 
     monkeypatch.setattr("ddt.ghidra.subprocess.run", fake_run)
     project = tmp_path / "DDT_M2.gpr"
     project.write_text("", encoding="utf-8")
-    return ghidra.export_function(project, "fixture.exe", "1000:0000", tmp_path / "out.json",
-                                  ghidra=home)
+    out = destination if destination is not None else tmp_path / "out.json"
+    return ghidra.export_function(project, "fixture.exe", "1000:0000", out, ghidra=home)
 
 
 def test_export_function_returns_validated_record(tmp_path, monkeypatch):
@@ -115,6 +115,42 @@ def test_export_function_requires_output(tmp_path, monkeypatch):
     home = _fake_ghidra(tmp_path)
     with pytest.raises(DDTError, match="produced no output"):
         _run_export(tmp_path, monkeypatch, lambda out: None, home)
+
+
+def test_export_function_rejects_nonzero_exit(tmp_path, monkeypatch):
+    home = _fake_ghidra(tmp_path)
+    with pytest.raises(DDTError, match="exit status 3"):
+        _run_export(tmp_path, monkeypatch, lambda out: None, home, returncode=3)
+
+
+def test_export_function_never_accepts_stale_destination(tmp_path, monkeypatch):
+    home = _fake_ghidra(tmp_path)
+    destination = tmp_path / "out.json"
+    stale = {"schema": ghidra.SCHEMA, "program": {"name": "stale"}, "function": {}}
+    destination.write_text(json.dumps(stale), encoding="utf-8")
+    with pytest.raises(DDTError):
+        _run_export(tmp_path, monkeypatch, lambda out: None, home, returncode=1,
+                    destination=destination)
+    assert json.loads(destination.read_text(encoding="utf-8")) == stale
+
+
+def test_export_function_replaces_destination_on_success(tmp_path, monkeypatch):
+    home = _fake_ghidra(tmp_path)
+    destination = tmp_path / "out.json"
+    destination.write_text(json.dumps({"schema": "old"}), encoding="utf-8")
+    fresh = {"schema": ghidra.SCHEMA, "program": {"name": "fresh"}, "function": {}}
+    result = _run_export(tmp_path, monkeypatch,
+                         lambda out: out.write_text(json.dumps(fresh), encoding="utf-8"),
+                         home, destination=destination)
+    assert result == fresh
+    assert json.loads(destination.read_text(encoding="utf-8")) == fresh
+
+
+def test_export_function_leaves_no_staging_files(tmp_path, monkeypatch):
+    home = _fake_ghidra(tmp_path)
+    with pytest.raises(DDTError):
+        _run_export(tmp_path, monkeypatch, lambda out: None, home, returncode=1)
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith("out.json.")] == []
 
 
 def test_export_function_rejects_wrong_schema(tmp_path, monkeypatch):
@@ -192,11 +228,9 @@ def test_integration_export_matches_fixture(tmp_path):
     headless = ghidra.locate_headless(home)
     subprocess.run([str(headless), str(projects), "DDT_M2", "-import", str(fixture)],
                    check=True, capture_output=True, text=True)
-    try:
-        record = ghidra.export_function(projects, "fixture.exe", "1000:0000",
-                                        tmp_path / "entry.json", ghidra=home)
-    except DDTError as exc:
-        pytest.skip(f"loader entry address differs for this Ghidra build: {exc}")
+    # Any unexpected export error must fail: only a missing Ghidra install skips.
+    record = ghidra.export_function(projects, "fixture.exe", "1000:0000",
+                                    tmp_path / "entry.json", ghidra=home)
     program = record["program"]
     function = record["function"]
     assert program["executable_format"].startswith("Old-style DOS Executable")
@@ -204,6 +238,7 @@ def test_integration_export_matches_fixture(tmp_path):
     assert program["executable_sha256"] == hashlib.sha256(_fixture_bytes()).hexdigest()
     assert function["entry"] == "1000:0000"
     assert function["instruction_count"] == 4
+    assert function["body_ranges"] == [{"min": "1000:0000", "max": "1000:0008", "length": 9}]
     first = function["instructions"][0]
     assert first["bytes"] == "e80900"
     assert first["source_file_offset"] == 64

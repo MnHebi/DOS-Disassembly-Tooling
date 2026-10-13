@@ -10,7 +10,9 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
+import tempfile
 
 from .errors import DDTError
 
@@ -97,27 +99,41 @@ def export_function(project: str | Path, program: str, address: str, out_path: s
     destination = Path(out_path)
     if destination.is_dir():
         raise DDTError(f"--out must be a file path, not a directory: {destination}")
-    command = build_command(headless, location, name, program, address, destination, scripts)
+    try:
+        staging = Path(tempfile.mkdtemp(prefix=destination.name + ".", dir=destination.parent))
+    except OSError as exc:
+        raise DDTError(f"cannot stage an export next to {destination}: {exc}") from exc
+    # Write to a private staging path so a failed run can never be mistaken for a
+    # stale-but-valid file already sitting at the destination.
+    staged = staging / "export.json"
+    command = build_command(headless, location, name, program, address, staged, scripts)
     env = dict(os.environ)
     if java_home is not None:
         env["JAVA_HOME"] = str(java_home)
     try:
-        proc = subprocess.run(command, capture_output=True, text=True, env=env, timeout=timeout)
-    except FileNotFoundError as exc:
-        raise DDTError(f"could not run Ghidra launcher {headless}: {exc}") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise DDTError(f"Ghidra export exceeded {timeout}s") from exc
-    if not destination.is_file():
-        raise DDTError("Ghidra export produced no output file; " + _output_tail(proc))
-    try:
-        record = json.loads(destination.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise DDTError(f"unreadable Ghidra export output: {exc}") from exc
-    if "error" in record:
-        raise DDTError(f"Ghidra export failed: {record['error']}")
-    if record.get("schema") != SCHEMA:
-        raise DDTError(f"unexpected Ghidra export schema: {record.get('schema')!r}")
-    return record
+        try:
+            proc = subprocess.run(command, capture_output=True, text=True, env=env, timeout=timeout)
+        except FileNotFoundError as exc:
+            raise DDTError(f"could not run Ghidra launcher {headless}: {exc}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise DDTError(f"Ghidra export exceeded {timeout}s") from exc
+        if proc.returncode != 0:
+            raise DDTError(
+                f"Ghidra export failed with exit status {proc.returncode}; " + _output_tail(proc))
+        if not staged.is_file():
+            raise DDTError("Ghidra export produced no output file; " + _output_tail(proc))
+        try:
+            record = json.loads(staged.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise DDTError(f"unreadable Ghidra export output: {exc}") from exc
+        if "error" in record:
+            raise DDTError(f"Ghidra export failed: {record['error']}")
+        if record.get("schema") != SCHEMA:
+            raise DDTError(f"unexpected Ghidra export schema: {record.get('schema')!r}")
+        os.replace(staged, destination)
+        return record
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def _output_tail(proc: subprocess.CompletedProcess) -> str:
