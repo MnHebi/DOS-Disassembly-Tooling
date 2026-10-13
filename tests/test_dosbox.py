@@ -484,3 +484,210 @@ def test_failed_capture_preserves_existing_output_and_original_error(tmp_path):
     assert "was not observed to stop" in str(error)
     assert out.read_text(encoding="utf-8") == "KEEP-ME"
     assert peer.bps == {}  # its own breakpoint was still removed during recovery
+
+
+# --- Stage 2: bounded instruction stepping -----------------------------------
+
+_FAKE_STATE = {"AX": "0000", "BX": "0000", "CX": "00FF", "DX": "0813", "SI": "0100", "DI": "FFFE",
+               "BP": "0000", "SP": "FFFE", "CS": "0813", "IP": "0100", "DS": "0813",
+               "ES": "0813", "SS": "0813"}
+
+
+class _FakeStepDOSBox(threading.Thread):
+    def __init__(self, port, *, advertise=True, refuse_stepin=None, malformed=False,
+                 fail_at_step=None, drop_on=None, refuse_run=False,
+                 script=({"AX": "1234", "IP": "0103"}, {"BX": "5678", "IP": "0106"})):
+        super().__init__(daemon=True)
+        self.port, self.advertise, self.refuse_stepin = port, advertise, refuse_stepin
+        self.malformed, self.fail_at_step, self.drop_on = malformed, fail_at_step, drop_on
+        self.refuse_run, self.script = refuse_run, list(script)
+        self.state = dict(_FAKE_STATE)
+        self.step_index, self.seen = 0, []
+
+    def run(self):
+        deadline = time.time() + 3.0
+        while True:
+            try:
+                conn = socket.create_connection(("127.0.0.1", self.port), timeout=2); break
+            except OSError:
+                if time.time() > deadline:
+                    return
+                time.sleep(0.05)
+        conn.settimeout(5)
+        buffer = b""
+        try:
+            while True:
+                try:
+                    data = conn.recv(4096)
+                except socket.timeout:
+                    return
+                if not data:
+                    return
+                buffer += data
+                while b"\n" in buffer:
+                    raw, buffer = buffer.split(b"\n", 1)
+                    parts = raw.decode().split(" ", 2)
+                    rid, command = parts[1], parts[2]
+                    self.seen.append(command)
+                    if self.drop_on is not None and command.startswith(self.drop_on):
+                        return
+                    status, lines = self._reply(command)
+                    conn.sendall(("\n".join([f"BEGIN {rid} {status}", *lines, f"END {rid}"]) + "\n").encode())
+        finally:
+            conn.close()
+
+    def _reply(self, command):
+        if command == "PING":
+            return "OK", ["PONG"]
+        if command == "EXEC HELP":
+            lines = ["Debugger commands (enter all values in hex or as register):", "-" * 12]
+            lines.append("STEPIN                    - Execute exactly one instruction, then stop."
+                         if self.advertise
+                         else "F11                       - Step into (no STEPIN command here).")
+            lines.append("CPU                       - Display CPU status information.")
+            return "OK", lines
+        if command.startswith("EXEC EV "):
+            names = command.split()[2:]
+            return "OK", [f"EV of '{' '.join(names)}' is:", " ".join(self.state[n] for n in names)]
+        if command == "EXEC STEPIN":
+            self.step_index += 1
+            if self.fail_at_step == self.step_index:
+                return "ERR", ["*** Debugger command not recognized"]
+            if self.refuse_stepin is not None:
+                return "ERR", [self.refuse_stepin]
+            if self.malformed:
+                return "OK", ["DEBUG: STEPIN executed"]
+            self.state.update(self.script[min(self.step_index - 1, len(self.script) - 1)])
+            return "OK", [f"DEBUG: STEPIN CS:IP={self.state['CS']}:{self.state['IP']} "
+                          f"AX={self.state['AX']} BX={self.state['BX']} "
+                          f"CX={self.state['CX']} DX={self.state['DX']}"]
+        if command == "EXEC RUN":
+            return ("ERR", ["*** refused"]) if self.refuse_run else ("OK", ["OK"])
+        return "ERR", ["*** Debugger command not recognized"]
+
+
+def _capture_steps(port, peer, **kwargs):
+    result, errors = {}, {}
+
+    def target():
+        try:
+            result["record"] = dosbox.capture_steps(port, settle=0.0, **kwargs)
+        except Exception as exc:  # noqa: BLE001 - captured for assertion
+            errors["error"] = exc
+
+    worker = threading.Thread(target=target)
+    worker.start()
+    peer.start()
+    worker.join(timeout=30)
+    peer.join(timeout=5)
+    return result.get("record"), errors.get("error"), peer
+
+
+def test_capture_steps_records_two_instructions():
+    port = _free_port()
+    record, error, peer = _capture_steps(port, _FakeStepDOSBox(port), count=2)
+    assert error is None
+    assert record["schema"] == "ddt.dosbox-steps.v1"
+    assert record["requested_count"] == 2 and record["completed_count"] == 2
+    assert record["capability"] == {"checked_with": "EXEC HELP", "stepin_advertised": True,
+                                    "evidence": ["STEPIN                    - Execute exactly one "
+                                                 "instruction, then stop."]}
+    assert record["initial"]["cs_ip"] == "0813:0100"
+    assert [s["cs_ip"] for s in record["steps"]] == ["0813:0103", "0813:0106"]
+    assert record["steps"][0]["changed"] == {"AX": ["0000", "1234"], "IP": ["0100", "0103"]}
+    assert record["steps"][1]["changed"] == {"BX": ["0000", "5678"], "IP": ["0103", "0106"]}
+    assert record["steps"][0]["reported"]["cs_ip"] == "0813:0103"
+    assert record["steps"][0]["raw"] and record["final"]["cs_ip"] == "0813:0106"
+    assert record["resume_requested"] is False and record["run_acknowledged"] is False
+    assert record["paused_state"] == "unknown"
+    assert any("left stopped" in limit for limit in record["limits"])
+    assert not any(command == "EXEC RUN" for command in peer.seen)
+
+
+def test_unsupported_capability_never_executes_a_step():
+    port = _free_port()
+    record, error, peer = _capture_steps(port, _FakeStepDOSBox(port, advertise=False), count=1)
+    assert record is None
+    assert "does not advertise STEPIN" in str(error)
+    assert not any(command == "EXEC STEPIN" for command in peer.seen)
+
+
+def test_not_stopped_is_distinguished_from_unsupported():
+    port = _free_port()
+    peer = _FakeStepDOSBox(port, refuse_stepin="DEBUG: STEPIN requires the debugger to be stopped")
+    record, error, peer = _capture_steps(port, peer, count=3)
+    assert record is None
+    assert "is not stopped" in str(error) and "DEBUGBOX" in str(error)
+    assert [c for c in peer.seen if c == "EXEC STEPIN"] == ["EXEC STEPIN"]  # stops after the first
+
+
+def test_malformed_step_response_stops_the_sequence():
+    port = _free_port()
+    record, error, peer = _capture_steps(port, _FakeStepDOSBox(port, malformed=True), count=2)
+    assert record is None
+    assert "did not report" in str(error)
+    assert [c for c in peer.seen if c == "EXEC STEPIN"] == ["EXEC STEPIN"]
+
+
+def test_partial_failure_reports_the_step_number():
+    port = _free_port()
+    record, error, peer = _capture_steps(port, _FakeStepDOSBox(port, fail_at_step=2), count=3)
+    assert record is None
+    assert "step 2" in str(error)
+    assert len([c for c in peer.seen if c == "EXEC STEPIN"]) == 2
+
+
+def test_disconnect_during_a_step_is_an_error():
+    port = _free_port()
+    record, error, _ = _capture_steps(port, _FakeStepDOSBox(port, drop_on="EXEC STEPIN"), count=2)
+    assert record is None
+    assert isinstance(error, DDTError)
+
+
+def test_step_count_validation_and_maximum():
+    for bad in (0, -1, 65, True):
+        with pytest.raises(DDTError, match="count must be"):
+            dosbox.capture_steps(1, count=bad)
+    port = _free_port()
+    record, error, _ = _capture_steps(port, _FakeStepDOSBox(port), count=64)
+    assert error is None and record["completed_count"] == 64
+
+
+def test_explicit_resume_is_acknowledged_not_assumed():
+    port = _free_port()
+    record, error, peer = _capture_steps(port, _FakeStepDOSBox(port), count=1, resume=True)
+    assert error is None
+    assert record["resume_requested"] is True and record["run_acknowledged"] is True
+    assert any(command == "EXEC RUN" for command in peer.seen)
+    assert any("does not prove" in limit for limit in record["limits"])
+
+
+def test_steps_output_is_written_atomically_and_preserved_on_failure(tmp_path):
+    port = _free_port()
+    out = tmp_path / "steps.json"
+    record, error, _ = _capture_steps(port, _FakeStepDOSBox(port), count=1, out=out)
+    assert error is None
+    assert json.loads(out.read_text(encoding="utf-8")) == record
+    port2 = _free_port()
+    out2 = tmp_path / "keep.json"
+    out2.write_text("KEEP", encoding="utf-8")
+    record2, error2, _ = _capture_steps(port2, _FakeStepDOSBox(port2, fail_at_step=1),
+                                        count=2, out=out2)
+    assert record2 is None and "step 1" in str(error2)
+    assert out2.read_text(encoding="utf-8") == "KEEP"
+
+
+def test_cli_capture_steps(tmp_path):
+    port = _free_port()
+    peer = _FakeStepDOSBox(port)
+    peer.start()
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src") + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run([sys.executable, "-m", "ddt", "debugger", "capture-steps",
+                           "--port", str(port), "--count", "2", "--settle", "0",
+                           "--timeout", "10", "--json"],
+                          check=True, capture_output=True, text=True, env=env)
+    payload = json.loads(proc.stdout)
+    assert payload["schema"] == "ddt.dosbox-steps.v1"
+    assert payload["completed_count"] == 2 and payload["final"]["cs_ip"] == "0813:0106"
+    peer.join(timeout=5)

@@ -23,6 +23,7 @@ A small, read-only, cross-platform toolkit for examining 16-bit DOS executables.
 - Read-only runtime capture intake: compare an operator's before/after artifact snapshots
 - Optional DOSBox-X debugger CPU-state capture (needs a debugger-enabled DOSBox-X build)
 - Optional DOSBox-X execution-breakpoint capture at an explicit runtime address
+- Optional DOSBox-X single-instruction stepping (only on builds advertising `STEPIN`)
 - Versioned JSON output and a nonzero exit code on invalid input
 - Native Linux and Windows packaging workflow using native runners
 
@@ -45,6 +46,7 @@ ddt identify PROGRAM.EXE --json
 ddt capture intake --before ./capture-before --after ./capture-after --json
 ddt debugger capture-cpu --port 58991 --out cpu.json --json
 ddt debugger capture-breakpoint --port 58991 --segment 0x0813 --offset 0x0103 --out bp.json --json
+ddt debugger capture-steps --port 58991 --count 2 --out steps.json --json
 ddt ghidra export --project ./proj --program GAME.EXE --function 1000:0000 --out func.json --json
 ddt code callers --export func.json --json
 ddt code callees --export func.json --json
@@ -99,6 +101,8 @@ This needs a DOSBox-X built with the internal debugger **and** SDL_net (`./confi
 Captured values are DOSBox-X runtime observations, not Ghidra addresses, module offsets or original file offsets, and DDT never translates between them. The DOSBox-X build identity is not obtainable over the protocol, so pass `--dosbox-version` to record one. The debugger's `MEMDUMPBIN` memory dump was independently verified to work, but it is not exposed by DDT yet because its output is written into the emulated DOS drive rather than a DDT-controlled location.
 
 `ddt debugger capture-breakpoint --segment 0x0813 --offset 0x0103` installs one real-mode execution breakpoint at an explicit runtime `segment:offset` (no automatic translation from any other address space), confirms it through `BPLIST`, resumes, and reports `ddt.dosbox-breakpoint.v2`. DOSBox-X exposes **no asynchronous breakpoint-hit event** — the control channel only has `PING`, `BREAK` and `EXEC`, and its event sender is never called. So DDT distinguishes an *observation* from a *verified hit*: `target_ip_observed_stable` is true when CS:IP stays on the requested address across several differently spaced register queries after resuming (without issuing another `BREAK`), while `breakpoint_hit_verified` and `stop_reason` stay `null` because the protocol cannot prove a stop (a tight self-loop at the target could look identical). Cleanup also distinguishes a `BPDEL` acknowledgement from an *independently verified* absence in a final `BPLIST` (`delete_acknowledged`/`final_list_verified`/`removal_verified`), and only the address-verified breakpoint DDT installed is deleted — unrelated user breakpoints are preserved and `BPDEL *` is never used. `run_acknowledged` records that `RUN` was accepted, `paused_state` stays `unknown`, and `--leave-paused` keeps the emulator stopped. (v2 replaces v1's `hit_confirmed`/`resumed`/`paused_at_capture` fields.)
+
+`ddt debugger capture-steps --count 2` steps an already-stopped program one guest instruction at a time and reports `ddt.dosbox-steps.v1` with the initial/last register state, each step's observed register differences, and the raw debugger responses. **`STEPIN` is an optional DOSBox-X capability**: upstream DOSBox-X 2026.10.01 does not include it, and the existing `capture-cpu`/`capture-breakpoint` commands do not require it. DDT checks support from the debugger's non-executing `EXEC HELP` output and refuses with a clear message when a build does not advertise `STEPIN` — it never executes an instruction to discover capability. The program must already be stopped at the intended instruction (start it with `DEBUGBOX`, or break in first); DDT never issues `BREAK` to establish a starting point. Stepping *changes guest execution state*, and DDT leaves the debugger stopped afterwards unless `--resume` is given (whose `RUN` acknowledgement is recorded but is not proof that execution resumed). A step may be a jump, call or interrupt, so CS:IP can move non-sequentially and an `INT` may enter a handler; register values are runtime observations, never Ghidra addresses or file offsets. The experimental emulator patch that adds `STEPIN` is separate from DDT and is not upstream (see the accompanying patch/PR draft).
 
 ## Distribution builds
 

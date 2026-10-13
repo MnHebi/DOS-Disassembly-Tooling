@@ -12,6 +12,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import tempfile
@@ -21,12 +22,15 @@ from .errors import DDTError
 
 SCHEMA = "ddt.dosbox-cpu.v1"
 BREAKPOINT_SCHEMA = "ddt.dosbox-breakpoint.v2"
+STEPS_SCHEMA = "ddt.dosbox-steps.v1"
 PROTOCOL = "dosbox-x debugger control (line-oriented REQ/BEGIN/END)"
 DEFAULT_PORT = 58991
 DEFAULT_TIMEOUT = 60.0
 DEFAULT_COMMAND_TIMEOUT = 15.0
 DEFAULT_CONFIRM = 4
 DEFAULT_CONFIRM_WINDOW = 1.6
+DEFAULT_STEPS = 1
+MAX_STEPS = 64
 MAX_RESPONSE_BYTES = 1 << 20
 MAX_RESPONSE_LINES = 4096
 REGISTERS = ("AX", "BX", "CX", "DX", "SI", "DI", "BP", "SP", "CS", "IP", "DS", "ES", "SS")
@@ -56,6 +60,21 @@ _BREAKPOINT_LIMITS = _LIMITS + [
     "Only the address-verified breakpoint DDT installed is deleted; unrelated user breakpoints "
     "are preserved and BPDEL * is never used",
 ]
+
+_STEPS_LIMITS = _LIMITS + [
+    "Each step is one guest instruction executed by DOSBox-X's DEBUG_Run(1); register values are "
+    "runtime observations, not Ghidra addresses, module offsets or original file offsets",
+    "No instruction bytes, mnemonics or semantics are inferred from the observed register values",
+    "A step may be a jump, call or interrupt, so CS:IP can move non-sequentially and an INT may "
+    "enter an interrupt handler instead of returning to the caller",
+    "STEPIN is an experimental DOSBox-X capability published in an experimental patch; upstream "
+    "DOSBox-X 2026.10.01 does not provide it",
+    "The debugger must already be stopped at the intended instruction (for example via DEBUGBOX); "
+    "DDT never issues BREAK to establish a starting point",
+]
+
+_STEP_LINE = re.compile(
+    r"CS:IP=([0-9A-Fa-f]{1,4}):([0-9A-Fa-f]{1,4})\s+AX=([0-9A-Fa-f]{1,4})\s+BX=([0-9A-Fa-f]{1,4})")
 
 
 def _loopback(host: str) -> bool:
@@ -138,12 +157,12 @@ def _parse_registers(raw: list[str]) -> dict[str, str] | None:
     tokens = " ".join(raw[1:]).split() if len(raw) > 1 else []
     if len(tokens) != len(REGISTERS):
         return None
-    for token in tokens:
-        try:
-            int(token, 16)
-        except ValueError:
-            return None
-    return dict(zip(REGISTERS, tokens))
+    try:
+        # DOSBox-X prints unpadded hex; normalize to fixed-width uppercase so
+        # records are stable and CS:IP reads consistently (no value is inferred).
+        return {name: f"{int(token, 16):04X}" for name, token in zip(REGISTERS, tokens)}
+    except ValueError:
+        return None
 
 
 def _hex16(value: int) -> str:
@@ -186,6 +205,38 @@ def _entry_address(entry: str) -> str | None:
         return f"{int(segment, 16):04X}:{int(offset, 16):04X}"
     except (ValueError, IndexError):
         return None
+
+
+def _advertises_stepin(raw_lines: list[str]) -> bool:
+    """True only when the debugger HELP lists a STEPIN command entry."""
+    for line in raw_lines:
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and parts[0] == "STEPIN" and "-" in parts[1]:
+            return True
+    return False
+
+
+def _parse_step_line(raw_lines: list[str]) -> dict | None:
+    for line in raw_lines:
+        match = _STEP_LINE.search(line)
+        if match:
+            cs, ip, ax, bx = (f"{int(value, 16):04X}" for value in match.groups())
+            return {"cs": cs, "ip": ip, "cs_ip": f"{cs}:{ip}", "AX": ax, "BX": bx}
+    return None
+
+
+def _differences(before: dict | None, after: dict | None) -> dict:
+    if not before or not after:
+        return {}
+    return {name: [before.get(name), after[name]] for name in after if before.get(name) != after[name]}
+
+
+def _step_failure(index: int, response: dict) -> str:
+    text = " ".join(response["raw"])
+    if "requires the debugger to be stopped" in text:
+        return (f"step {index}: the DOSBox-X debugger is not stopped; start the program with "
+                f"DEBUGBOX (or break in) so it is stopped at the intended instruction")
+    return f"step {index}: the debugger rejected STEPIN: {response['raw']}"
 
 
 def _write_json(destination: Path, record: dict) -> None:
@@ -274,6 +325,120 @@ def capture_cpu(port: int = DEFAULT_PORT, *, settle: float = 3.0, timeout: float
                     + ([] if leave_paused else ["resume requested (RUN acknowledgement recorded)"]),
         "unknown": unknown,
         "limits": list(_LIMITS),
+    }
+    if out is not None:
+        _write_json(Path(out), record)
+    return record
+
+
+def capture_steps(port: int = DEFAULT_PORT, *, count: int = DEFAULT_STEPS, settle: float = 3.0,
+                  timeout: float = DEFAULT_TIMEOUT, command_timeout: float = DEFAULT_COMMAND_TIMEOUT,
+                  dosbox_version: str | None = None, out: str | Path | None = None,
+                  resume: bool = False) -> dict:
+    """Step a stopped DOSBox-X program one instruction at a time.
+
+    STEPIN support is detected with the non-executing ``EXEC HELP`` command; DDT
+    never executes an instruction just to discover capability.
+    """
+    if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= MAX_STEPS:
+        raise DDTError(f"count must be an integer in 1..{MAX_STEPS}: {count!r}")
+    commands: list[dict] = []
+    steps: list[dict] = []
+    rid = 0
+    run_acknowledged = False
+    initial: dict | None = None
+    previous: dict | None = None
+
+    def next_rid() -> int:
+        nonlocal rid
+        rid += 1
+        return rid
+
+    with _accepted_connection(port, timeout) as conn:
+        commands.append(_request(conn, next_rid(), "PING", command_timeout))
+        if commands[-1]["status"] != "OK" or commands[-1]["raw"] != ["PONG"]:
+            raise DDTError("DOSBox-X debugger did not answer PING with PONG")
+        if settle > 0:
+            time.sleep(settle)
+        help_response = _request(conn, next_rid(), "EXEC HELP", command_timeout)
+        commands.append(help_response)
+        if help_response["status"] != "OK":
+            raise DDTError("could not read the debugger command list to check STEPIN support "
+                           f"(EXEC HELP was refused: {help_response['raw']})")
+        advertised = _advertises_stepin(help_response["raw"])
+        capability = {"checked_with": "EXEC HELP", "stepin_advertised": advertised,
+                      "evidence": [line.strip() for line in help_response["raw"]
+                                   if line.strip().split(None, 1)[:1] == ["STEPIN"]]}
+        if not advertised:
+            raise DDTError("Connected DOSBox-X debugger does not advertise STEPIN; use a "
+                           "debugger-enabled build with external stepping support.")
+        registers_response = _request(conn, next_rid(), "EXEC EV " + " ".join(REGISTERS),
+                                      command_timeout)
+        commands.append(registers_response)
+        initial = (_parse_registers(registers_response["raw"])
+                   if registers_response["status"] == "OK" else None)
+        if initial is None:
+            raise DDTError(f"could not read the initial registers: {registers_response['raw']}")
+        previous = initial
+        for index in range(1, count + 1):
+            step_response = _request(conn, next_rid(), "EXEC STEPIN", command_timeout)
+            commands.append(step_response)
+            if step_response["status"] != "OK":
+                raise DDTError(_step_failure(index, step_response))
+            reported = _parse_step_line(step_response["raw"])
+            if reported is None:
+                raise DDTError(f"step {index}: the STEPIN response did not report the resulting "
+                               f"CS:IP/registers ({step_response['raw']!r})")
+            after_response = _request(conn, next_rid(), "EXEC EV " + " ".join(REGISTERS),
+                                      command_timeout)
+            commands.append(after_response)
+            after = (_parse_registers(after_response["raw"])
+                     if after_response["status"] == "OK" else None)
+            if after is None:
+                raise DDTError(f"step {index}: the post-step register read was refused: "
+                               f"{after_response['raw']}")
+            steps.append({"index": index, "request": step_response["request"],
+                          "status": step_response["status"], "raw": step_response["raw"],
+                          "reported": reported, "registers": after,
+                          "cs_ip": f"{after['CS']}:{after['IP']}",
+                          "changed": _differences(previous, after)})
+            previous = after
+        if resume:
+            run = _request(conn, next_rid(), "EXEC RUN", command_timeout)
+            commands.append(run)
+            run_acknowledged = run["status"] == "OK"
+
+    def cs_ip(state: dict | None) -> str | None:
+        return f"{state['CS']}:{state['IP']}" if state else None
+
+    limits = list(_STEPS_LIMITS)
+    limits.append("RUN was requested after the steps; its acknowledgement does not prove that "
+                  "execution actually resumed" if resume
+                  else "Execution is left stopped in the debugger after the steps")
+    unknown = ["whether the emulator is paused or running (no stopped-state query exists)",
+               "instruction bytes, mnemonics and semantics "
+               "(only observed register values are recorded)"]
+    if not dosbox_version:
+        unknown.append("DOSBox-X build identity (not queried over the protocol)")
+    if resume and not run_acknowledged:
+        unknown.append("whether emulation resumed (the RUN acknowledgement was not received)")
+    record = {
+        "schema": STEPS_SCHEMA,
+        "endpoint": {"host": "127.0.0.1", "port": port},
+        "protocol": PROTOCOL,
+        "dosbox_version": dosbox_version,
+        "capability": capability,
+        "requested_count": count,
+        "completed_count": len(steps),
+        "initial": {"registers": initial, "cs_ip": cs_ip(initial)},
+        "steps": steps,
+        "final": {"registers": previous, "cs_ip": cs_ip(previous)},
+        "resume_requested": resume,
+        "run_acknowledged": run_acknowledged,
+        "paused_state": "unknown",
+        "commands": commands,
+        "unknown": unknown,
+        "limits": limits,
     }
     if out is not None:
         _write_json(Path(out), record)
