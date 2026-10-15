@@ -155,3 +155,72 @@ def test_cli_compare_reference_offline(tmp_path):
     assert bad.returncode == 2 and json.loads(bad.stderr)["error_type"] == "DDTError"
     # the existing three-source comparison schema is untouched
     assert memory.SCHEMA == "ddt.memory-comparison.v1"
+
+
+def test_out_must_not_overwrite_either_input(tmp_path):
+    reference = _write(tmp_path, "ORIG.EXE", REFERENCE, binary=True)
+    observation = _write(tmp_path, "memory.json", _observation())
+    reference_before = reference.read_bytes()
+    observation_before = observation.read_bytes()
+    with pytest.raises(DDTError, match="must not overwrite the reference binary"):
+        memory.compare_reference(observation, reference, 64, out=reference)
+    with pytest.raises(DDTError, match="must not overwrite the observation"):
+        memory.compare_reference(observation, reference, 64, out=observation)
+    assert reference.read_bytes() == reference_before
+    assert observation.read_bytes() == observation_before
+    # an unrelated existing output is preserved when the request is rejected
+    other = tmp_path / "other.json"
+    other.write_text("KEEP", encoding="utf-8")
+    with pytest.raises(DDTError, match="must not overwrite"):
+        memory.compare_reference(observation, reference, 64, out=reference)
+    assert other.read_text(encoding="utf-8") == "KEEP"
+
+
+def test_out_equivalent_paths_and_symlink_aliases_are_rejected(tmp_path):
+    reference = _write(tmp_path, "ORIG.EXE", REFERENCE, binary=True)
+    observation = _write(tmp_path, "memory.json", _observation())
+    equivalent = tmp_path / "sub" / ".." / "ORIG.EXE"
+    with pytest.raises(DDTError, match="must not overwrite the reference binary"):
+        memory.compare_reference(observation, reference, 64, out=equivalent)
+    alias = tmp_path / "alias.exe"
+    try:
+        alias.symlink_to(reference)
+    except OSError:
+        pytest.skip("symlinks are unavailable on this platform")
+    with pytest.raises(DDTError, match="must not overwrite the reference binary"):
+        memory.compare_reference(observation, reference, 64, out=alias)
+    assert reference.read_bytes() == REFERENCE
+
+
+def test_memread_extent_bounds_are_enforced(tmp_path):
+    reference = _write(tmp_path, "ORIG.EXE", REFERENCE, binary=True)
+    crossing = _write(tmp_path, "crossing.json",
+                      _observation("E8" * 32, address="0823:FFF0"))
+    with pytest.raises(DDTError, match="64 KiB segment boundary"):
+        memory.compare_reference(crossing, reference, 0)
+    beyond = _write(tmp_path, "beyond.json", _observation("E8", address="A000:0000"))
+    with pytest.raises(DDTError, match="beyond conventional RAM"):
+        memory.compare_reference(beyond, reference, 0)
+    # a legitimate range right at the conventional-RAM limit is still accepted
+    last = _write(tmp_path, "last.json", _observation("E8", address="9FFF:000F"))
+    assert memory.compare_reference(last, reference, 0)["results"]["runtime_equals_reference"] in (True, False)
+
+
+def test_boolean_lengths_and_malformed_register_containers_are_rejected(tmp_path):
+    reference = _write(tmp_path, "ORIG.EXE", REFERENCE, binary=True)
+    record = _observation("E8")
+    record["response"] = {"address": "0823:0000", "length": True}
+    with pytest.raises(DDTError, match="response length"):
+        memory.compare_reference(_write(tmp_path, "bool-len.json", record), reference, 0)
+    record = _observation("E8")
+    record["byte_count"] = True
+    with pytest.raises(DDTError, match="byte_count"):
+        memory.compare_reference(_write(tmp_path, "bool-count.json", record), reference, 0)
+    record = _observation()
+    record["initial"] = "0813:0100"
+    with pytest.raises(DDTError, match="register container is not an object"):
+        memory.compare_reference(_write(tmp_path, "bad-initial.json", record), reference, 64)
+    record = _observation()
+    record["final"] = 42
+    with pytest.raises(DDTError, match="register container is not an object"):
+        memory.compare_reference(_write(tmp_path, "bad-final.json", record), reference, 64)

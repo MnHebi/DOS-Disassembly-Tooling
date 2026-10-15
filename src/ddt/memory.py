@@ -79,6 +79,13 @@ def _hex16(value, label: str) -> str:
     return f"{int(value, 16):04X}"
 
 
+def _observed_cs_ip(container, label: str) -> str:
+    if not isinstance(container, dict):
+        raise DDTError(f"the observation's {label} register container is not an object: "
+                       f"{container!r}")
+    return _cs_ip(container.get("cs_ip"), f"the observation's {label} CS:IP")
+
+
 def _validated_observation(record: dict) -> tuple[str, int, str]:
     """Strictly validate a ddt.dosbox-memory.v1 receipt; return (address, length, bytes_hex)."""
     request = record.get("request")
@@ -95,6 +102,14 @@ def _validated_observation(record: dict) -> tuple[str, int, str]:
     if not isinstance(length, int) or isinstance(length, bool) or not 1 <= length <= MAX_MEMORY_BYTES:
         raise DDTError(f"the observation length is not an integer in 1..{MAX_MEMORY_BYTES}: "
                        f"{length!r}")
+    # MEMREAD's own bounds, so a receipt can never describe a read the command refuses.
+    segment_value, offset_value = (int(part, 16) for part in address.split(":"))
+    if offset_value + length > 0x10000:
+        raise DDTError(f"the observed range {address} + {length} bytes crosses a 64 KiB segment "
+                       f"boundary")
+    if segment_value * 16 + offset_value + length > 0xA0000:
+        raise DDTError(f"the observed range {address} + {length} bytes extends beyond conventional "
+                       f"RAM below A0000h")
     for field in ("read_success", "cs_ip_unchanged"):
         if record.get(field) is not True:
             raise DDTError(f"the memory observation does not record {field}=true "
@@ -102,14 +117,14 @@ def _validated_observation(record: dict) -> tuple[str, int, str]:
     if _cs_ip(response.get("address"), "the observation's response address") != address:
         raise DDTError(f"the observation's response address {response.get('address')!r} does not "
                        f"match the requested {address}")
-    if response.get("length") != length:
+    if type(response.get("length")) is not int or response["length"] != length:
         raise DDTError(f"the observation's response length {response.get('length')!r} does not "
                        f"match the requested {length}")
-    if record.get("byte_count") != length:
+    if type(record.get("byte_count")) is not int or record["byte_count"] != length:
         raise DDTError(f"the observation's byte_count {record.get('byte_count')!r} does not match "
                        f"the requested {length}")
-    initial = _cs_ip((record.get("initial") or {}).get("cs_ip"), "the observation's initial CS:IP")
-    final = _cs_ip((record.get("final") or {}).get("cs_ip"), "the observation's final CS:IP")
+    initial = _observed_cs_ip(record.get("initial"), "initial")
+    final = _observed_cs_ip(record.get("final"), "final")
     if initial != final:
         raise DDTError(f"the memory observation's CS:IP changed ({initial} -> {final}) but "
                        f"cs_ip_unchanged is true")
@@ -165,7 +180,12 @@ def compare_reference(observation: str | Path, reference_binary: str | Path,
         "limitations": list(_REFERENCE_LIMITATIONS),
     }
     if out is not None:
-        _write_json(Path(out), result)
+        destination = Path(out)
+        for label, source in (("the observation", Path(observation)),
+                              ("the reference binary", Path(reference_binary))):
+            if destination.resolve() == source.resolve():
+                raise DDTError(f"--out must not overwrite {label}: {destination}")
+        _write_json(destination, result)
     return result
 
 
