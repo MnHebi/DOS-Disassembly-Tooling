@@ -17,7 +17,7 @@ from .errors import DDTError
 from .format import inspect, map_address
 from .ghidra import export_function
 from .identify import identify
-from .linexec import inspect_le
+from .linexec import extract_le_bytes, inspect_le
 from .memory import compare as compare_memory, compare_reference
 from .strings import extract
 
@@ -61,6 +61,13 @@ def main(argv: list[str] | None = None) -> int:
                               help="Inspect a validated LE header, object table and page map")
     leh.add_argument("path", type=Path)
     leh.add_argument("--json", action="store_true")
+    leb = commands.add_parser("le-bytes",
+                              help="Extract original-file bytes from one validated LE page")
+    leb.add_argument("path", type=Path)
+    leb.add_argument("--object", required=True, type=_num, help="1-based LE object index")
+    leb.add_argument("--offset", required=True, type=_num, help="Object-relative byte offset")
+    leb.add_argument("--length", required=True, type=int, help="Bytes to extract (1..256)")
+    leb.add_argument("--json", action="store_true")
     cor = commands.add_parser("correlate",
                               help="Derive a candidate runtime address for an exported instruction")
     cor.add_argument("--binary", required=True, type=Path, help="Original COM or MZ executable")
@@ -190,6 +197,8 @@ def main(argv: list[str] | None = None) -> int:
             output = identify(args.path, args.format)
         elif args.command == "le-header":
             output = inspect_le(args.path)
+        elif args.command == "le-bytes":
+            output = extract_le_bytes(args.path, args.object, args.offset, args.length)
         elif args.command == "correlate":
             output = correlate(args.binary, args.format, args.export, args.instruction,
                                args.entry_observation)

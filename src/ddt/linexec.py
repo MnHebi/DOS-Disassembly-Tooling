@@ -1,6 +1,6 @@
-"""Read-only structural inspection of an LE (linear executable) DOS image.
+"""Read-only structural inspection and bounded byte extraction for LE images.
 
-Only the validated LE header, object table and object page map are reported.
+Only the validated LE header, object table and object page map are used.
 Nothing is loaded, relocated, decompressed or executed, and an original-file
 offset is never presented as a runtime ``segment:offset`` address.
 """
@@ -12,21 +12,39 @@ from pathlib import Path
 from .errors import DDTError
 from .format import _LE_CPU_TYPES, _LE_OS_TYPES, _digest, _read_input
 
-SCHEMA = "ddt.le-header.v1"
+HEADER_SCHEMA = "ddt.le-header.v1"
+BYTES_SCHEMA = "ddt.le-bytes.v1"
 LE_HEADER_BYTES = 0xB0
 OBJECT_RECORD_BYTES = 24
 PAGE_MAP_ENTRY_BYTES = 4
 MIN_PAGE_SIZE = 0x200
 MAX_PAGES = 65536
 MAX_OBJECTS = 4096
+MAX_EXTRACT_BYTES = 256
 
-_LIMITS = [
+# LE page-map flag values (`bld/watcom/h/exeflat.h`: PAGE_VALID .. PAGE_RANGE) with the
+# names OpenWatcom's `wdump` prints. Only PAGE_VALID pages hold an ordinary file image.
+_PAGE_TYPES = {0: "valid", 1: "iterated", 2: "invalid", 3: "zeroed", 4: "range",
+               5: "compressed", 6: "unknown", 7: "unknown", 8: "m3-packed"}
+
+_HEADER_LIMITS = [
     "LE header, object table and object page map only; no load, relocation, "
     "decompression or execution is performed",
     "Offsets are original-file offsets, never runtime segment:offset addresses",
     "The LE/LX OS type field is not a reliable identifier of a specific DOS extender",
     "LX headers are recognised by ddt identify but are not inspected here",
-    "The entry file offset is a page-map derivation, not an observed runtime address",
+    "A file offset is reported only for an ordinary file-backed (PAGE_VALID) page; "
+    "iterated, zeroed, range, compressed and invalid pages have no direct file image",
+    "Entry and stack file offsets are page-map derivations, not observed runtime addresses",
+]
+
+_BYTES_LIMITS = [
+    "Original-file byte extraction only: nothing is loaded, relocated, decompressed "
+    "or executed, and memory is never written back into the executable",
+    "The derived file offset is not a runtime address; the LE page map does not "
+    "describe the loaded image's segment:offset form",
+    "Only an ordinary file-backed (PAGE_VALID) page is extractable, and only within "
+    "the bytes that actually exist in the file",
 ]
 
 
@@ -59,17 +77,20 @@ def _page_map_entry(data: bytes, offset: int) -> tuple[int, int]:
     return page, (raw >> 24) & 0xFF
 
 
+def _page_type(flags: int) -> str:
+    return _PAGE_TYPES.get(flags, "unknown")
+
+
 def _file_page_offset(data_pages_offset: int, page_size: int, page_number: int) -> int:
     return data_pages_offset + (page_number - 1) * page_size
 
 
 def _file_page_bytes(page_number: int, page_count: int, page_size: int, last_page_size: int) -> int:
-    """Bytes occupied in the file by file page ``page_number`` (the last one may be short)."""
+    """Bytes the page occupies in the file (the declared last page may be short)."""
     return last_page_size if page_number == page_count else page_size
 
 
-def inspect_le(path: str | Path) -> dict:
-    data = _read_input(Path(path))
+def _parse(data: bytes) -> dict:
     le = _header_offset(data)
     if le + LE_HEADER_BYTES > len(data):
         raise DDTError("LE header extends past the end of the file")
@@ -114,16 +135,19 @@ def inspect_le(path: str | Path) -> dict:
         for page_index in range(pages):
             page_number, page_flags = _page_map_entry(
                 data, le + page_map_offset + (map_index - 1 + page_index) * PAGE_MAP_ENTRY_BYTES)
+            kind = _page_type(page_flags)
             file_offset = None
-            if page_number:
+            file_bytes = None
+            if kind == "valid" and page_number:
                 if page_number > page_count:
                     raise DDTError(f"LE page map references page {page_number} beyond the module")
                 file_offset = _file_page_offset(data_pages_offset, page_size, page_number)
-                if file_offset + _file_page_bytes(page_number, page_count, page_size,
-                                                  last_page_size) > len(data):
+                file_bytes = _file_page_bytes(page_number, page_count, page_size, last_page_size)
+                if file_offset + file_bytes > len(data):
                     raise DDTError(f"LE page {page_number} lies past the end of the file")
             object_pages.append({"page_number": page_number, "flags": page_flags,
-                                 "file_offset": file_offset})
+                                 "page_type": kind, "file_offset": file_offset,
+                                 "file_bytes": file_bytes})
         objects.append({"index": index + 1, "virtual_size": size, "relocation_base": reloc,
                         "flags": flags, "page_map_index": map_index, "page_count": pages,
                         "pages": object_pages})
@@ -144,11 +168,12 @@ def inspect_le(path: str | Path) -> dict:
         raise DDTError("LE entry offset is outside the entry object's mapped pages")
     entry_page = entry["pages"][entry_page_index]
     entry_file_offset = None
-    if entry_page["page_number"]:
-        entry_file_offset = _file_page_offset(data_pages_offset, page_size,
-                                              entry_page["page_number"]) + entry_offset % page_size
+    if entry_page["file_offset"] is not None:
+        within = entry_offset % page_size
+        if within < entry_page["file_bytes"]:
+            entry_file_offset = entry_page["file_offset"] + within
     return {
-        "schema": SCHEMA,
+        "schema": HEADER_SCHEMA,
         "source_size": len(data),
         "sha256": _digest(data),
         "container": {
@@ -184,8 +209,67 @@ def inspect_le(path: str | Path) -> dict:
         "entry": {
             "object": entry_object,
             "offset": entry_offset,
+            "page_type": entry_page["page_type"],
             "file_offset": entry_file_offset,
             "mapped_to_file": entry_file_offset is not None,
         },
-        "limits": _LIMITS,
+        "limits": _HEADER_LIMITS,
+    }
+
+
+def inspect_le(path: str | Path) -> dict:
+    """Validate and report an LE container's header, objects and page map."""
+    return _parse(_read_input(Path(path)))
+
+
+def extract_le_bytes(path: str | Path, object_index: int, offset: int, length: int) -> dict:
+    """Extract bytes from one ordinary file-backed LE page; nothing is loaded."""
+    if isinstance(object_index, bool) or not isinstance(object_index, int) or object_index < 1:
+        raise DDTError("the LE object index must be a positive 1-based integer")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise DDTError("the LE object-relative offset must be a nonnegative integer")
+    if isinstance(length, bool) or not isinstance(length, int) or not 1 <= length <= MAX_EXTRACT_BYTES:
+        raise DDTError(f"the LE extraction length must be 1..{MAX_EXTRACT_BYTES} bytes")
+    source = Path(path)
+    data = _read_input(source)
+    record = _parse(data)
+    header = record["header"]
+    if object_index > header["object_count"]:
+        raise DDTError(f"LE object index {object_index} is outside the object table")
+    target = record["objects"][object_index - 1]
+    if offset >= target["virtual_size"]:
+        raise DDTError(f"LE object-relative offset {offset} is outside object "
+                       f"{object_index}'s virtual size")
+    page_size = header["page_size"]
+    page_index = offset // page_size
+    if (offset + length - 1) // page_size != page_index:
+        raise DDTError("the requested LE bytes span more than one object page")
+    if page_index >= target["page_count"]:
+        raise DDTError(f"LE object-relative offset {offset} is outside object "
+                       f"{object_index}'s mapped pages")
+    page = target["pages"][page_index]
+    if page["file_offset"] is None:
+        raise DDTError(f"LE object {object_index} page {page_index + 1} is "
+                       f"'{page['page_type']}' and has no direct file image")
+    within = offset % page_size
+    if within + length > page["file_bytes"]:
+        raise DDTError(f"the requested bytes extend past the page's initialized file extent "
+                       f"({page['file_bytes']} bytes)")
+    file_offset = page["file_offset"] + within
+    if file_offset + length > len(data):
+        raise DDTError("the requested bytes extend past the end of the file")
+    return {
+        "schema": BYTES_SCHEMA,
+        "source": {"path": str(source), "size": len(data), "sha256": record["sha256"]},
+        "object": object_index,
+        "object_offset": offset,
+        "length": length,
+        "page_map_index": target["page_map_index"] + page_index,
+        "page_number": page["page_number"],
+        "page_flags": page["flags"],
+        "page_type": page["page_type"],
+        "object_page_bytes": page["file_bytes"],
+        "file_offset": file_offset,
+        "bytes_hex": data[file_offset:file_offset + length].hex().upper(),
+        "limits": _BYTES_LIMITS,
     }
