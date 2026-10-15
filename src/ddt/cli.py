@@ -17,6 +17,7 @@ from .errors import DDTError
 from .format import inspect, map_address
 from .ghidra import export_function
 from .identify import identify
+from .linexec import inspect_le
 from .memory import compare as compare_memory, compare_reference
 from .strings import extract
 
@@ -56,6 +57,10 @@ def main(argv: list[str] | None = None) -> int:
     idn.add_argument("path", type=Path)
     idn.add_argument("--format", choices=["auto", "mz", "com"], default="auto")
     idn.add_argument("--json", action="store_true")
+    leh = commands.add_parser("le-header",
+                              help="Inspect a validated LE header, object table and page map")
+    leh.add_argument("path", type=Path)
+    leh.add_argument("--json", action="store_true")
     cor = commands.add_parser("correlate",
                               help="Derive a candidate runtime address for an exported instruction")
     cor.add_argument("--binary", required=True, type=Path, help="Original COM or MZ executable")
@@ -183,6 +188,8 @@ def main(argv: list[str] | None = None) -> int:
             output = extract(args.path, args.min_length, args.max_results)
         elif args.command == "identify":
             output = identify(args.path, args.format)
+        elif args.command == "le-header":
+            output = inspect_le(args.path)
         elif args.command == "correlate":
             output = correlate(args.binary, args.format, args.export, args.instruction,
                                args.entry_observation)

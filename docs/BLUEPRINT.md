@@ -19,7 +19,7 @@ The core remains a Python command-line application with a versioned JSON interfa
 
 ### Out of scope in the first two releases
 
-Source-level decompilation of an entire program; DOS game simulation; automatic game GUI manipulation; patching originals; invented symbolic meaning for state fields; automatic discovery of all indirect calls; unpacking every DOS packer; protected-mode DOS extenders; NE/LE/LX/PE analysis; full 8086 emulation; use of CEO data files as generic test fixtures.
+Source-level decompilation of an entire program; DOS game simulation; automatic game GUI manipulation; patching originals; invented symbolic meaning for state fields; automatic discovery of all indirect calls; unpacking every DOS packer; protected-mode DOS extenders and their runtime; loading, relocating or executing NE/LX/PE images or an LE load module (only the validated LE header, object table and page map are parsed); full 8086 emulation; use of CEO data files as generic test fixtures.
 
 ## 2. Architecture
 
