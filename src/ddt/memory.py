@@ -10,13 +10,33 @@ import hashlib
 from pathlib import Path
 
 from .correlate import _load_json
-from .dosbox import MEMORY_SCHEMA
+from .dosbox import MAX_MEMORY_BYTES, MEMORY_SCHEMA, _write_json
 from .errors import DDTError
 from .format import _read_input, parse_mz
 
 SCHEMA = "ddt.memory-comparison.v1"
+REFERENCE_SCHEMA = "ddt.memory-reference-comparison.v1"
 CORRELATION_SCHEMA = "ddt.address-correlation.v1"
 MAX_DIFFERENCES = 64
+
+_REFERENCE_LIMITATIONS = [
+    "The reference offset is an operator-supplied original-file byte offset: DDT neither derives, "
+    "verifies nor repairs the intended correspondence between the two byte ranges",
+    "A byte match (or mismatch) is verified for the two supplied sequences only; it does not "
+    "establish executable identity, load history, that those instructions executed, unpacking "
+    "causality, or any source-file mapping into a packed executable",
+    "Relocations, loader activity or runtime modification can legitimately make a correct runtime "
+    "range differ from the reference bytes; DDT reports the difference and never adjusts the "
+    "operator's offset",
+]
+
+_REFERENCE_UNESTABLISHED = [
+    "executable identity",
+    "load history",
+    "that the observed region executed as those instructions",
+    "unpacking causality",
+    "a source-file mapping into the packed executable",
+]
 
 _LIMITATIONS = [
     "The comparison reports evidence, not a cause: differences between the sources can come from "
@@ -50,6 +70,103 @@ def _cs_ip(value, label: str) -> str:
         if not part or len(part) > 4 or any(c not in "0123456789abcdefABCDEF" for c in part):
             raise DDTError(f"{label} is not a valid 16-bit segment:offset value: {value!r}")
     return f"{int(parts[0], 16):04X}:{int(parts[1], 16):04X}"
+
+
+def _hex16(value, label: str) -> str:
+    if (not isinstance(value, str) or not value or len(value) > 4
+            or any(c not in "0123456789abcdefABCDEF" for c in value)):
+        raise DDTError(f"{label} is not a 16-bit hexadecimal value: {value!r}")
+    return f"{int(value, 16):04X}"
+
+
+def _validated_observation(record: dict) -> tuple[str, int, str]:
+    """Strictly validate a ddt.dosbox-memory.v1 receipt; return (address, length, bytes_hex)."""
+    request = record.get("request")
+    response = record.get("response")
+    if not isinstance(request, dict) or not isinstance(response, dict):
+        raise DDTError("the memory observation has no request/response record")
+    address = _cs_ip(request.get("cs_ip"), "the observation's requested address")
+    declared = f"{_hex16(request.get('segment'), 'the requested segment')}:" \
+               f"{_hex16(request.get('offset'), 'the requested offset')}"
+    if declared != address:
+        raise DDTError(f"the observation's requested address {address} does not match its "
+                       f"segment:offset fields {declared}")
+    length = request.get("length")
+    if not isinstance(length, int) or isinstance(length, bool) or not 1 <= length <= MAX_MEMORY_BYTES:
+        raise DDTError(f"the observation length is not an integer in 1..{MAX_MEMORY_BYTES}: "
+                       f"{length!r}")
+    for field in ("read_success", "cs_ip_unchanged"):
+        if record.get(field) is not True:
+            raise DDTError(f"the memory observation does not record {field}=true "
+                           f"({record.get(field)!r}); refusing to compare")
+    if _cs_ip(response.get("address"), "the observation's response address") != address:
+        raise DDTError(f"the observation's response address {response.get('address')!r} does not "
+                       f"match the requested {address}")
+    if response.get("length") != length:
+        raise DDTError(f"the observation's response length {response.get('length')!r} does not "
+                       f"match the requested {length}")
+    if record.get("byte_count") != length:
+        raise DDTError(f"the observation's byte_count {record.get('byte_count')!r} does not match "
+                       f"the requested {length}")
+    initial = _cs_ip((record.get("initial") or {}).get("cs_ip"), "the observation's initial CS:IP")
+    final = _cs_ip((record.get("final") or {}).get("cs_ip"), "the observation's final CS:IP")
+    if initial != final:
+        raise DDTError(f"the memory observation's CS:IP changed ({initial} -> {final}) but "
+                       f"cs_ip_unchanged is true")
+    return address, length, _hex_bytes(record.get("bytes_hex"), length, "the observed bytes",
+                                       required=True)
+
+
+def compare_reference(observation: str | Path, reference_binary: str | Path,
+                      reference_offset: int, *, out: str | Path | None = None) -> dict:
+    """Compare an observed runtime region with an operator-selected reference file range."""
+    record = _load_json(observation, MEMORY_SCHEMA, "memory observation")
+    address, length, runtime_hex = _validated_observation(record)
+    if not isinstance(reference_offset, int) or isinstance(reference_offset, bool) \
+            or reference_offset < 0:
+        raise DDTError(f"the reference offset must be a nonnegative integer: {reference_offset!r}")
+    reference = Path(reference_binary)
+    data = _read_input(reference)
+    sha256 = hashlib.sha256(data).hexdigest()
+    if reference_offset + length > len(data):
+        raise DDTError(f"the reference file is only {len(data)} bytes; the requested range "
+                       f"{reference_offset}..{reference_offset + length} does not fit")
+    reference_bytes = data[reference_offset:reference_offset + length]
+    runtime = bytes.fromhex(runtime_hex)
+    differences = [{"relative_offset": index,
+                    "reference_file_offset": reference_offset + index,
+                    "runtime": f"{runtime[index]:02X}",
+                    "reference": f"{reference_bytes[index]:02X}"}
+                   for index in range(length) if runtime[index] != reference_bytes[index]]
+    result = {
+        "schema": REFERENCE_SCHEMA,
+        "provenance": {"correspondence": "operator_supplied",
+                       "note": "the reference offset was supplied by the operator; DDT neither "
+                               "derived nor verified the intended correspondence"},
+        "observation": {"source": str(observation), "schema": record["schema"], "address": address,
+                        "length": length, "bytes_hex": runtime_hex,
+                        "read_success": record["read_success"],
+                        "cs_ip_unchanged": record["cs_ip_unchanged"]},
+        "reference": {"path": str(reference), "sha256": sha256, "size": len(data),
+                      "file_offset": reference_offset,
+                      "bytes_hex": reference_bytes.hex().upper()},
+        "results": {"runtime_equals_reference": runtime == reference_bytes},
+        "differences": differences[:MAX_DIFFERENCES],
+        "difference_count": len(differences),
+        "differences_truncated": len(differences) > MAX_DIFFERENCES,
+        "checks": {"observation_schema": True, "read_success": True, "cs_ip_unchanged": True,
+                   "addresses_consistent": True, "lengths_consistent": True,
+                   "reference_extent_within_file": True},
+        "verified": (["the two supplied byte sequences are equal"] if not differences
+                     else ["the two supplied byte sequences differ at the listed offsets"]),
+        "operator_assertion": ["the runtime region and the reference file range are intended to "
+                               "correspond"],
+        "not_established": list(_REFERENCE_UNESTABLISHED),
+        "limitations": list(_REFERENCE_LIMITATIONS),
+    }
+    if out is not None:
+        _write_json(Path(out), result)
+    return result
 
 
 def compare(correlation: str | Path, observation: str | Path, binary: str | Path) -> dict:

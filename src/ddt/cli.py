@@ -17,7 +17,7 @@ from .errors import DDTError
 from .format import inspect, map_address
 from .ghidra import export_function
 from .identify import identify
-from .memory import compare as compare_memory
+from .memory import compare as compare_memory, compare_reference
 from .strings import extract
 
 
@@ -138,6 +138,15 @@ def main(argv: list[str] | None = None) -> int:
     mc.add_argument("--observation", required=True, type=Path, help="ddt.dosbox-memory.v1 JSON")
     mc.add_argument("--binary", required=True, type=Path, help="Original COM or MZ executable")
     mc.add_argument("--json", action="store_true")
+    mcr = mem_sub.add_parser("compare-reference",
+                             help="Compare an observed region with an operator-selected reference range")
+    mcr.add_argument("--observation", required=True, type=Path, help="ddt.dosbox-memory.v1 JSON")
+    mcr.add_argument("--reference-binary", required=True, type=Path,
+                     help="File whose bytes are the reference (never modified)")
+    mcr.add_argument("--reference-offset", required=True, type=_num,
+                     help="Original-file byte offset of the reference range (not a runtime address)")
+    mcr.add_argument("--out", type=Path, default=None, help="Write the comparison JSON here")
+    mcr.add_argument("--json", action="store_true")
     gh = commands.add_parser("ghidra", help="Optional read-only Ghidra integration")
     gh_sub = gh.add_subparsers(dest="ghidra_command", required=True)
     gx = gh_sub.add_parser("export", help="Export one analyzed function from an existing Ghidra project")
@@ -204,7 +213,11 @@ def main(argv: list[str] | None = None) -> int:
                                        timeout=args.timeout, dosbox_version=args.dosbox_version,
                                        out=args.out, resume=args.resume)
         elif args.command == "memory":
-            output = compare_memory(args.correlation, args.observation, args.binary)
+            if args.memory_command == "compare":
+                output = compare_memory(args.correlation, args.observation, args.binary)
+            else:
+                output = compare_reference(args.observation, args.reference_binary,
+                                           args.reference_offset, out=args.out)
         elif args.command == "ghidra":
             output = export_function(args.project, args.program, args.function, args.out,
                                      ghidra=args.ghidra, java_home=args.java_home, timeout=args.timeout)
