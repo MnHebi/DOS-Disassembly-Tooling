@@ -336,8 +336,9 @@ def test_fixups_decode_internal_records_per_logical_page(tmp_path):
     assert first_page["records"][0] == {
         "file_offset": first_page["records"][0]["file_offset"], "bytes_hex": "07001B00020400",
         "source_type": 7, "source_type_name": "offset32", "source_flags": 0x07,
-        "source_offset": 0x1B, "source_file_offset": DATA_PAGES_OFFSET + 0x1B,
-        "source_within_page": True, "target_type": "internal", "target_object": 2,
+        "source_offset": 0x1B, "source_offset_signed": 0x1B, "source_page": 0,
+        "source_file_offset": DATA_PAGES_OFFSET + 0x1B, "source_within_page": True,
+        "source_contiguous_bytes": 8, "target_type": "internal", "target_object": 2,
         "target_offset": 4, "target_offset_width": 2, "target_object_16bit": False}
 
     second_page = inspect_le_fixups(path, 1)
@@ -379,13 +380,76 @@ def test_fixups_segment_source_carries_no_target_offset(tmp_path):
     assert record["target_offset_width"] is None
 
 
-def test_fixups_report_a_source_outside_the_page(tmp_path):
+def test_fixups_read_a_negative_source_offset_as_signed(tmp_path):
+    # 0xFFFF is -1: the fixup begins in the logical page before the selected one. With no
+    # such page here, the raw value is kept and no file offset is invented.
     outside = _record(0x07, 0x00, 0xFFFF, object_index=2, target_offset=0x012D)
     path = _write(tmp_path, _with_fixups(_le_image(virtual_size=0x2000), [outside]))
     record = inspect_le_fixups(path, 0)["records"][0]
     assert record["source_offset"] == 0xFFFF
+    assert record["source_offset_signed"] == -1
+    assert record["source_page"] == -1
     assert record["source_file_offset"] is None
+    assert record["source_contiguous_bytes"] is None
     assert record["source_within_page"] is False
+
+
+def test_fixups_map_a_negative_source_offset_through_the_preceding_page(tmp_path):
+    # The same four bytes are described from both sides of the boundary: the preceding
+    # page names its last byte, this page names offset -1. Both must resolve to one byte.
+    straddling = _record(0x07, 0x00, 0xFFFF, object_index=2, target_offset=0x012D)
+    previous = _record(0x07, 0x00, 0x0FFF, object_index=2, target_offset=0x012D)
+    path = _write(tmp_path, _with_fixups(_le_image(virtual_size=0x2000), [previous, straddling]))
+    boundary = DATA_PAGES_OFFSET + 0x0FFF
+
+    from_before = inspect_le_fixups(path, 0)["records"][0]
+    assert from_before["source_offset"] == 0x0FFF
+    assert from_before["source_page"] == 0
+    assert from_before["source_file_offset"] == boundary
+    assert from_before["source_contiguous_bytes"] == 8
+
+    from_after = inspect_le_fixups(path, 1)["records"][0]
+    assert from_after["source_offset"] == 0xFFFF           # raw value preserved
+    assert from_after["source_offset_signed"] == -1
+    assert from_after["source_page"] == 0
+    assert from_after["source_file_offset"] == boundary    # same byte, not invented
+    assert from_after["source_within_page"] is False
+    assert from_after["source_contiguous_bytes"] == 8
+
+
+def test_fixups_report_no_source_offset_when_the_preceding_page_has_no_file_image(tmp_path):
+    straddling = _record(0x07, 0x00, 0xFFFF, object_index=2, target_offset=0x012D)
+    path = _write(tmp_path, _with_fixups(_le_image(virtual_size=0x2000, page_flags=(3, 0)),
+                                         [b"", straddling]))
+    record = inspect_le_fixups(path, 1)["records"][0]
+    assert record["source_offset_signed"] == -1
+    assert record["source_page"] == 0
+    assert record["source_file_offset"] is None
+    assert record["source_contiguous_bytes"] is None
+
+
+@pytest.mark.parametrize("flags,reason", [
+    (0x04, "additive-value"), (0x08, "internal-chain"),
+    (0x20, "32-bit-additive"), (0x80, "8-bit-ordinal")])
+def test_fixups_stop_at_unimplemented_target_flags(tmp_path, flags, reason):
+    ordinary = _record(0x07, 0x00, 0x1B, object_index=2, target_offset=4)
+    flagged = _record(0x07, flags, 0x2F, object_index=2, target_offset=0x100)
+    path = _write(tmp_path, _with_fixups(_le_image(virtual_size=0x2000), [ordinary + flagged]))
+    record = inspect_le_fixups(path, 0)
+    assert record["record_count"] == 1                     # the flagged record is not an
+    assert record["records"][0]["bytes_hex"] == "07001B00020400"   # ordinary relocation
+    assert record["undecoded"]["file_offset"] == record["records"][0]["file_offset"] + 7
+    assert record["undecoded"]["record_bytes"] == 7
+    assert reason in record["undecoded"]["reason"]
+
+
+def test_fixups_stop_at_the_alias_source_flag(tmp_path):
+    aliased = _record(0x17, 0x00, 0x1B, object_index=2, target_offset=4)
+    path = _write(tmp_path, _with_fixups(_le_image(virtual_size=0x2000), [aliased]))
+    record = inspect_le_fixups(path, 0)
+    assert record["record_count"] == 0
+    assert record["undecoded"]["record_bytes"] == 7
+    assert "alias-source" in record["undecoded"]["reason"]
 
 
 def test_fixups_stop_at_an_unsupported_record_form(tmp_path):

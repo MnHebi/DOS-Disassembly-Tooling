@@ -20,6 +20,8 @@ OBJECT_RECORD_BYTES = 24
 PAGE_MAP_ENTRY_BYTES = 4
 FIXUP_PAGE_ENTRY_BYTES = 4
 MIN_FIXUP_RECORD_BYTES = 4
+# Wider than any LE fixup source field (pointer48 is six bytes); bounds the contiguity walk.
+MAX_SOURCE_CONTIGUOUS_BYTES = 8
 MIN_PAGE_SIZE = 0x200
 MAX_PAGES = 65536
 MAX_OBJECTS = 4096
@@ -37,9 +39,18 @@ _SOURCE_TYPES = {0x00: "byte", 0x01: "undefined", 0x02: "segment", 0x03: "pointe
 _TARGET_TYPES = {0x00: "internal", 0x01: "import_ordinal", 0x02: "import_name",
                  0x03: "internal_via_entry"}
 _SFLAG_LIST = 0x20
+_SFLAG_FIXUP_TO_ALIAS = 0x10
 _TARGET_MASK = 0x03
 _TFLAG_OFF_32BIT = 0x10
 _TFLAG_OBJ_MOD_16BIT = 0x40
+# Target flag bits that change a record's shape or meaning in ways this decoder does not
+# implement; each is listed with the name `bld/watcom/h/exeflat.h` gives it.
+_UNIMPLEMENTED_TARGET_FLAGS = (
+    (0x04, "additive-value"),
+    (0x08, "internal-chain"),
+    (0x20, "32-bit-additive"),
+    (0x80, "8-bit-ordinal"),
+)
 
 _HEADER_LIMITS = [
     "LE header, object table and object page map only; no load, relocation, "
@@ -67,8 +78,15 @@ _FIXUP_LIMITS = [
     "applies them and never reports the value a loader would write",
     "A record's own file offset is not the file offset of the value it describes; "
     "source_file_offset is",
-    "Only internal-reference records are decoded; any other record form stops decoding at "
-    "its file offset and is reported as undecoded rather than guessed at",
+    "A source offset is signed: a negative value begins in the preceding logical page, so "
+    "source_file_offset can name a byte outside the selected page, mapped through that "
+    "page's own file extent and never by subtracting from the selected page's offset",
+    "source_contiguous_bytes reports how many consecutive file-backed bytes follow "
+    "source_file_offset (capped at 8), because logical page adjacency does not imply "
+    "physical file adjacency",
+    "Only unadorned internal-reference records are decoded; other target forms, the list "
+    "and alias source flags, and the additive, chain, 32-bit-additive and 8-bit-ordinal "
+    "target flags stop decoding at their file offset and are reported as undecoded",
     "The declared fixup-section size is reported but not used for bounds; the fixup page "
     "table's final entry bounds the record table and is checked against the file",
 ]
@@ -316,6 +334,34 @@ class _UnsupportedFixup(Exception):
     """A well-formed fixup record form this milestone does not decode."""
 
 
+def _source_location(record: dict, page_count: int, page_size: int,
+                     page: int, within: int) -> int | None:
+    """File offset of one byte of a logical page, or None when it has no file image."""
+    if not 0 <= page < page_count or not 0 <= within < page_size:
+        return None
+    owner = _fixup_page_owner(record, page)
+    if owner is None:
+        return None
+    entry = owner[0]["pages"][owner[1]]
+    if entry["file_offset"] is None or within >= entry["file_bytes"]:
+        return None
+    return entry["file_offset"] + within
+
+
+def _contiguous_bytes(record: dict, page_count: int, page_size: int,
+                      page: int, within: int, first: int) -> int:
+    """Consecutive file-backed bytes starting at ``first``, capped for bounded work."""
+    count = 1
+    while count < MAX_SOURCE_CONTIGUOUS_BYTES:
+        position = within + count
+        following = _source_location(record, page_count, page_size,
+                                     page + position // page_size, position % page_size)
+        if following != first + count:
+            break
+        count += 1
+    return count
+
+
 def _decode_fixup(data: bytes, cursor: int, end: int) -> dict:
     """Decode one internal-reference LE fixup record; return it with its end offset."""
     def need(position: int, width: int) -> None:
@@ -327,9 +373,14 @@ def _decode_fixup(data: bytes, cursor: int, end: int) -> dict:
     flags = data[cursor + 1]
     if source_flags & _SFLAG_LIST:
         raise _UnsupportedFixup("list-form fixup records are not decoded")
+    if source_flags & _SFLAG_FIXUP_TO_ALIAS:
+        raise _UnsupportedFixup("alias-source fixup records are not decoded")
     if flags & _TARGET_MASK:
         raise _UnsupportedFixup(f"{_TARGET_TYPES[flags & _TARGET_MASK]} fixup records are "
                                 "not decoded")
+    for bit, name in _UNIMPLEMENTED_TARGET_FLAGS:
+        if flags & bit:
+            raise _UnsupportedFixup(f"the {name} fixup flag (0x{bit:02X}) is not decoded")
     source_type = source_flags & 0x0F
     if source_type not in _SOURCE_TYPES:
         raise _UnsupportedFixup(f"fixup source type 0x{source_type:02X} is not decoded")
@@ -401,6 +452,7 @@ def inspect_le_fixups(path: str | Path, page: int) -> dict:
     page_file_bytes = page_entry["file_bytes"] if page_entry else None
     records = []
     undecoded = None
+    page_size = header["page_size"]
     cursor = start
     while cursor < end:
         try:
@@ -408,13 +460,18 @@ def inspect_le_fixups(path: str | Path, page: int) -> dict:
         except _UnsupportedFixup as exc:
             undecoded = {"file_offset": cursor, "record_bytes": end - cursor, "reason": str(exc)}
             break
-        within = False
-        if page_file_offset is not None and decoded["source_offset"] < page_file_bytes:
-            within = True
-            decoded["source_file_offset"] = page_file_offset + decoded["source_offset"]
-        else:
-            decoded["source_file_offset"] = None
-        decoded["source_within_page"] = within
+        raw_offset = decoded["source_offset"]
+        signed = raw_offset - 0x10000 if raw_offset & 0x8000 else raw_offset
+        page_delta, within = divmod(signed, page_size)
+        source_page = page + page_delta
+        location = _source_location(record, page_count, page_size, source_page, within)
+        decoded["source_offset_signed"] = signed
+        decoded["source_page"] = source_page
+        decoded["source_file_offset"] = location
+        decoded["source_within_page"] = location is not None and source_page == page
+        decoded["source_contiguous_bytes"] = (
+            None if location is None else
+            _contiguous_bytes(record, page_count, page_size, source_page, within, location))
         records.append(decoded)
     return {
         "schema": FIXUPS_SCHEMA,
@@ -439,6 +496,7 @@ def inspect_le_fixups(path: str | Path, page: int) -> dict:
             "page_type": page_entry["page_type"] if page_entry else None,
             "page_file_offset": page_file_offset,
             "page_file_bytes": page_file_bytes,
+            "page_size": page_size,
             "record_table_offset": offsets[page],
             "record_table_end": offsets[page + 1],
         },
