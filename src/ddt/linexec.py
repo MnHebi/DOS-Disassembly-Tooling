@@ -35,7 +35,8 @@ _HEADER_LIMITS = [
     "LX headers are recognised by ddt identify but are not inspected here",
     "A file offset is reported only for an ordinary file-backed (PAGE_VALID) page; "
     "iterated, zeroed, range, compressed and invalid pages have no direct file image",
-    "Entry and stack file offsets are page-map derivations, not observed runtime addresses",
+    "The entry file offset is a page-map derivation, not an observed runtime address; "
+    "the reported stack object and offset are raw header values, not verified file offsets",
 ]
 
 _BYTES_LIMITS = [
@@ -240,6 +241,9 @@ def extract_le_bytes(path: str | Path, object_index: int, offset: int, length: i
     if offset >= target["virtual_size"]:
         raise DDTError(f"LE object-relative offset {offset} is outside object "
                        f"{object_index}'s virtual size")
+    if offset + length > target["virtual_size"]:
+        raise DDTError(f"the requested bytes extend past object {object_index}'s virtual size "
+                       f"({target['virtual_size']} bytes)")
     page_size = header["page_size"]
     page_index = offset // page_size
     if (offset + length - 1) // page_size != page_index:

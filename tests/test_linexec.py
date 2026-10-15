@@ -217,6 +217,18 @@ def test_extracts_from_the_short_final_page(tmp_path):
     assert record["object_page_bytes"] == 0x40
 
 
+def test_extraction_respects_the_object_virtual_extent(tmp_path):
+    # Object virtual size 0x80 while its physical page holds a full 0x1000 bytes of file
+    # data, so the page alone would otherwise let a request run past the object.
+    path = _write(tmp_path, _le_image())
+    with pytest.raises(DDTError, match="past object 1's virtual size \\(128 bytes\\)"):
+        extract_le_bytes(path, 1, 0x7F, 2)
+    assert extract_le_bytes(path, 1, 0x7E, 2)["file_offset"] == 0x18E
+    assert extract_le_bytes(path, 1, 0x7E, 2)["bytes_hex"] == \
+        bytes((0x18E + i) * 3 + 1 & 0xFF for i in range(2)).hex().upper()
+    assert extract_le_bytes(path, 1, 0x7F, 1)["file_offset"] == 0x18F
+
+
 def test_extraction_rejects_bounds_and_unsupported_pages(tmp_path):
     ordinary = _write(tmp_path, _le_image(virtual_size=0x2000))
     with pytest.raises(DDTError, match="span more than one object page"):
