@@ -14,9 +14,12 @@ from .format import _LE_CPU_TYPES, _LE_OS_TYPES, _digest, _read_input
 
 HEADER_SCHEMA = "ddt.le-header.v1"
 BYTES_SCHEMA = "ddt.le-bytes.v1"
+FIXUPS_SCHEMA = "ddt.le-fixups.v1"
 LE_HEADER_BYTES = 0xB0
 OBJECT_RECORD_BYTES = 24
 PAGE_MAP_ENTRY_BYTES = 4
+FIXUP_PAGE_ENTRY_BYTES = 4
+MIN_FIXUP_RECORD_BYTES = 4
 MIN_PAGE_SIZE = 0x200
 MAX_PAGES = 65536
 MAX_OBJECTS = 4096
@@ -26,6 +29,17 @@ MAX_EXTRACT_BYTES = 256
 # names OpenWatcom's `wdump` prints. Only PAGE_VALID pages hold an ordinary file image.
 _PAGE_TYPES = {0: "valid", 1: "iterated", 2: "invalid", 3: "zeroed", 4: "range",
                5: "compressed", 6: "unknown", 7: "unknown", 8: "m3-packed"}
+
+# LE fixup record fields (`bld/watcom/h/exeflat.h`, decoded as OpenWatcom's wdump does).
+_SOURCE_TYPES = {0x00: "byte", 0x01: "undefined", 0x02: "segment", 0x03: "pointer32",
+                 0x05: "offset16", 0x06: "pointer48", 0x07: "offset32",
+                 0x08: "self_relative_offset32"}
+_TARGET_TYPES = {0x00: "internal", 0x01: "import_ordinal", 0x02: "import_name",
+                 0x03: "internal_via_entry"}
+_SFLAG_LIST = 0x20
+_TARGET_MASK = 0x03
+_TFLAG_OFF_32BIT = 0x10
+_TFLAG_OBJ_MOD_16BIT = 0x40
 
 _HEADER_LIMITS = [
     "LE header, object table and object page map only; no load, relocation, "
@@ -46,6 +60,17 @@ _BYTES_LIMITS = [
     "describe the loaded image's segment:offset form",
     "Only an ordinary file-backed (PAGE_VALID) page is extractable, and only within "
     "the bytes that actually exist in the file",
+]
+
+_FIXUP_LIMITS = [
+    "Fixup records are encoded loader requests, not observed runtime state: DDT never "
+    "applies them and never reports the value a loader would write",
+    "A record's own file offset is not the file offset of the value it describes; "
+    "source_file_offset is",
+    "Only internal-reference records are decoded; any other record form stops decoding at "
+    "its file offset and is reported as undecoded rather than guessed at",
+    "The declared fixup-section size is reported but not used for bounds; the fixup page "
+    "table's final entry bounds the record table and is checked against the file",
 ]
 
 
@@ -276,4 +301,149 @@ def extract_le_bytes(path: str | Path, object_index: int, offset: int, length: i
         "file_offset": file_offset,
         "bytes_hex": data[file_offset:file_offset + length].hex().upper(),
         "limits": _BYTES_LIMITS,
+    }
+
+
+def _fixup_page_owner(record: dict, page: int) -> tuple[dict, int] | None:
+    for obj in record["objects"]:
+        first = obj["page_map_index"] - 1
+        if first <= page < first + obj["page_count"]:
+            return obj, page - first
+    return None
+
+
+class _UnsupportedFixup(Exception):
+    """A well-formed fixup record form this milestone does not decode."""
+
+
+def _decode_fixup(data: bytes, cursor: int, end: int) -> dict:
+    """Decode one internal-reference LE fixup record; return it with its end offset."""
+    def need(position: int, width: int) -> None:
+        if position + width > end:
+            raise DDTError(f"the LE fixup record at file offset {cursor} is truncated")
+
+    need(cursor, MIN_FIXUP_RECORD_BYTES)
+    source_flags = data[cursor]
+    flags = data[cursor + 1]
+    if source_flags & _SFLAG_LIST:
+        raise _UnsupportedFixup("list-form fixup records are not decoded")
+    if flags & _TARGET_MASK:
+        raise _UnsupportedFixup(f"{_TARGET_TYPES[flags & _TARGET_MASK]} fixup records are "
+                                "not decoded")
+    source_type = source_flags & 0x0F
+    if source_type not in _SOURCE_TYPES:
+        raise _UnsupportedFixup(f"fixup source type 0x{source_type:02X} is not decoded")
+    source_offset = _u16(data, cursor + 2)
+    position = cursor + 4
+    if flags & _TFLAG_OBJ_MOD_16BIT:
+        need(position, 2)
+        target_object = _u16(data, position)
+        position += 2
+    else:
+        need(position, 1)
+        target_object = data[position]
+        position += 1
+    target_offset = None
+    target_width = None
+    if source_type != 0x02:                      # a segment fixup carries no target offset
+        target_width = 4 if flags & _TFLAG_OFF_32BIT else 2
+        need(position, target_width)
+        target_offset = _u32(data, position) if target_width == 4 else _u16(data, position)
+        position += target_width
+    return {
+        "file_offset": cursor,
+        "bytes_hex": data[cursor:position].hex().upper(),
+        "source_type": source_type,
+        "source_type_name": _SOURCE_TYPES[source_type],
+        "source_flags": source_flags,
+        "source_offset": source_offset,
+        "target_type": "internal",
+        "target_object": target_object,
+        "target_offset": target_offset,
+        "target_offset_width": target_width,
+        "target_object_16bit": bool(flags & _TFLAG_OBJ_MOD_16BIT),
+    }, position
+def inspect_le_fixups(path: str | Path, page: int) -> dict:
+    """Report the validated fixup records of one logical LE page."""
+    if isinstance(page, bool) or not isinstance(page, int) or page < 0:
+        raise DDTError("the LE page index must be a nonnegative integer")
+    source = Path(path)
+    data = _read_input(source)
+    record = _parse(data)
+    le = record["container"]["le_header_offset"]
+    header = record["header"]
+    page_count = header["page_count"]
+    if page >= page_count:
+        raise DDTError(f"LE page index {page} is outside the module's {page_count} pages")
+    section_size = _u32(data, le + 0x30)
+    page_table_offset = _u32(data, le + 0x68)
+    record_table_offset = _u32(data, le + 0x6C)
+    if not page_table_offset:
+        raise DDTError("the LE header declares no fixup page table")
+    if page_table_offset > record_table_offset:
+        raise DDTError("the LE fixup page table starts after the fixup record table")
+    if record_table_offset - page_table_offset < (page_count + 1) * FIXUP_PAGE_ENTRY_BYTES:
+        raise DDTError("the LE fixup page table is too small for the module's pages")
+    record_table = le + record_table_offset
+    if record_table > len(data):
+        raise DDTError("the LE fixup record table offset is past the end of the file")
+    offsets = [_u32(data, le + page_table_offset + index * FIXUP_PAGE_ENTRY_BYTES)
+               for index in range(page_count + 1)]
+    if any(later < earlier for earlier, later in zip(offsets, offsets[1:])):
+        raise DDTError("the LE fixup page table entries are not monotonic")
+    if record_table + offsets[-1] > len(data):
+        raise DDTError("the LE fixup record table extends past the end of the file")
+    start = record_table + offsets[page]
+    end = record_table + offsets[page + 1]
+    owner = _fixup_page_owner(record, page)
+    page_entry = owner[0]["pages"][owner[1]] if owner else None
+    page_file_offset = page_entry["file_offset"] if page_entry else None
+    page_file_bytes = page_entry["file_bytes"] if page_entry else None
+    records = []
+    undecoded = None
+    cursor = start
+    while cursor < end:
+        try:
+            decoded, cursor = _decode_fixup(data, cursor, end)
+        except _UnsupportedFixup as exc:
+            undecoded = {"file_offset": cursor, "record_bytes": end - cursor, "reason": str(exc)}
+            break
+        within = False
+        if page_file_offset is not None and decoded["source_offset"] < page_file_bytes:
+            within = True
+            decoded["source_file_offset"] = page_file_offset + decoded["source_offset"]
+        else:
+            decoded["source_file_offset"] = None
+        decoded["source_within_page"] = within
+        records.append(decoded)
+    return {
+        "schema": FIXUPS_SCHEMA,
+        "source": {"path": str(source), "size": len(data), "sha256": record["sha256"]},
+        "fixup_tables": {
+            "section_size": section_size,
+            "page_table_offset": page_table_offset,
+            "record_table_offset": record_table_offset,
+            "page_table_file_offset": le + page_table_offset,
+            "record_table_file_offset": record_table,
+            "record_table_file_end": record_table + offsets[-1],
+            "page_entry_count": page_count + 1,
+        },
+        "page": {
+            "index": page,
+            "index_convention": "zero-based logical page index, matching the fixup page "
+                                "table entries",
+            "object": owner[0]["index"] if owner else None,
+            "object_page": owner[1] if owner else None,
+            "page_map_index": owner[0]["page_map_index"] + owner[1] if owner else None,
+            "page_number": page_entry["page_number"] if page_entry else None,
+            "page_type": page_entry["page_type"] if page_entry else None,
+            "page_file_offset": page_file_offset,
+            "page_file_bytes": page_file_bytes,
+            "record_table_offset": offsets[page],
+            "record_table_end": offsets[page + 1],
+        },
+        "records": records,
+        "record_count": len(records),
+        "undecoded": undecoded,
+        "limits": _FIXUP_LIMITS,
     }

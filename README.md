@@ -21,7 +21,7 @@ A small, read-only, cross-platform toolkit for examining 16-bit DOS executables.
 - Read-only export of one analyzed function from an existing Ghidra project (optional; Ghidra is not needed for any other command)
 - Offline navigation over an exported function: direct callers/callees and memory readers/writers (no Ghidra required)
 - Read-only identification of DOS containers, embedded signatures and packaging markers
-- Read-only LE (linear executable) header, object-table and page-map inspection, plus bounded original-file byte extraction from one validated LE page
+- Read-only LE (linear executable) header, object-table, page-map and fixup-record inspection, plus bounded original-file byte extraction from one validated LE page
 - Read-only runtime capture intake: compare an operator's before/after artifact snapshots
 - Optional DOSBox-X debugger CPU-state capture (needs a debugger-enabled DOSBox-X build)
 - Optional DOSBox-X execution-breakpoint capture at an explicit runtime address
@@ -50,6 +50,7 @@ ddt strings GAME.EXE --json
 ddt identify PROGRAM.EXE --json
 ddt le-header PROGRAM.EXE --json
 ddt le-bytes PROGRAM.EXE --object 1 --offset 0x88 --length 16 --json
+ddt le-fixups PROGRAM.EXE --page 0 --json
 ddt capture intake --before ./capture-before --after ./capture-after --json
 ddt correlate --binary PROGRAM.EXE --format mz --export func.json --instruction 1000:000c --entry-observation steps.json --json
 ddt debugger capture-cpu --port 58991 --out cpu.json --json
@@ -105,6 +106,10 @@ The page-map flag byte is not decoration. LE distinguishes `valid`, `iterated`, 
 `ddt le-bytes PROGRAM.EXE --object 1 --offset 0x88 --length 16` extracts those original-file bytes directly, as `ddt.le-bytes.v1`: the source path/size/SHA-256, the 1-based object, the object-relative offset and request length, the page-map index, physical page number and flags, the derived original-file offset, and the exact bytes in hex. The request is bounded to 1–256 bytes, must lie entirely inside one `PAGE_VALID` page's initialized file extent, and must fit in the file; a multi-page request, an uninitialized or non-file-backed page, an out-of-range object/offset, or a malformed extent is rejected with a specific error rather than silently combined or zero-filled. This is **original-file byte extraction** — no relocation, decompression, protected-mode loading or runtime observation — and nothing is ever written back into the executable.
 
 Keep the four address kinds distinct: an **object-relative offset** is an index into one LE object; a **physical page number** selects a page in the file's data-page area; the derived **original-file offset** is `data_pages_offset + (page-1) * page_size + (offset mod page_size)`; and a **runtime address** is a protected-mode selector plus offset that DDT cannot observe at all. None of the first three implies the fourth.
+
+`ddt le-fixups PROGRAM.EXE --page 0` reports one logical page's **encoded fixup records** as `ddt.le-fixups.v1`. The fixup page table has one entry per module page plus a final sentinel, and its values bound each page's records inside the fixup record table; `--page` is a **zero-based logical page index** in that table, which is resolved to the owning object and object-page (the physical page number, page type and file extent are reported alongside). Each decoded record keeps its file offset, raw bytes, source type and flags, source offset, and the **original-file offset of the value it describes** (`source_file_offset`), plus the target object and target offset for the internal-reference form. It reports a page that has no records as such, and it never advances past a record form it does not decode: the remaining range is reported as an undecoded extent instead.
+
+Two things `le-fixups` deliberately does **not** do. It does not apply fixups, so it never claims what a loader would write — the records are the executable's *requests* to a loader, and `source_file_offset` locates the value, not the relocated value. And a record's own `file_offset` is not the file offset of the value it describes. `ddt le-bytes` is unchanged and still returns the raw, unrelocated original-file bytes. Only the internal-reference record form is decoded (verified against OpenWatcom's own `wdump` for every record of the fixture); other target forms, and the list form, stop decoding with an explicit `undecoded` extent. The declared fixup-section size is reported but not used for bounds.
 
 This is structural only: nothing is loaded, relocated, decompressed or executed, and no runtime `segment:offset` address is ever derived from a file offset. The header layout and the page-map encoding (a 24-bit big-endian page number plus one flag byte per entry) were checked against OpenWatcom's `wdump` and GNU `file` for one genuine, reproducible fixture: an OpenWatcom v2 `wcl386`/`wlink system dos4g` hello-world with a `0x220`-byte MZ stub, an `LE` header (CPU 2, OS 1), a `0x1000` page size over five pages (last page `0x414`), and entry `object 1:0x88` resolving to original file offset `2616`, where `EB 12` begins.
 
@@ -180,7 +185,7 @@ DDT's long-term goal is to explain **executable structures and the runtime evide
 - Headerless **COM**: inspection, explicit original-file offsets, runtime address correlation (verified end-to-end).
 - Conventional real-mode DOS **MZ**: header/relocation/overlay inspection, source-offset mapping, runtime correlation (verified end-to-end).
 - **Runtime observation** (optional, debugger-enabled DOSBox-X builds): bounded conventional-RAM reads, single-instruction stepping, one-instruction memory-change observation, and single-breakpoint capture — within the supported real-mode debugger environment.
-- **LE** (linear executable) DOS-extender containers: layout validation, object-table and page-map parsing with `ddt le-header`, and bounded original-file page extraction with `ddt le-bytes` — one genuine OpenWatcom/DOS-4GW fixture, no loading, relocation or execution.
+- **LE** (linear executable) DOS-extender containers: layout validation, object-table and page-map parsing with `ddt le-header`, bounded original-file page extraction with `ddt le-bytes`, and encoded fixup-record inspection with `ddt le-fixups` — one genuine OpenWatcom/DOS-4GW fixture, no loading, relocation or execution.
 - **Other containers** (NE, LX, PE, embedded COFF, packer markers): conservative **identification only**; DDT never claims to load or analyze them.
 
 **Planned investigation areas** — explicitly *not* implemented:

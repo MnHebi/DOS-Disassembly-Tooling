@@ -10,7 +10,7 @@ import sys
 import pytest
 
 from ddt.errors import DDTError
-from ddt.linexec import extract_le_bytes, inspect_le
+from ddt.linexec import extract_le_bytes, inspect_le, inspect_le_fixups
 
 LE_OFFSET = 0x40
 LE_HEADER_BYTES = 0xB0
@@ -69,6 +69,43 @@ def _le_image(*, signature=b"LE", cpu=2, os_type=1, page_size=0x1000, page_count
 def _patched(image: bytes, header_offset: int, value: int) -> bytes:
     data = bytearray(image)
     struct.pack_into("<I", data, LE_OFFSET + header_offset, value)
+    return bytes(data)
+
+
+def _record(source: int, flags: int, source_offset: int, object_index: int | None = None,
+            target_offset: int | None = None) -> bytes:
+    """Encode one synthetic LE fixup record (no list form)."""
+    body = bytes([source, flags]) + struct.pack("<H", source_offset)
+    if object_index is not None:
+        body += (struct.pack("<H", object_index) if flags & 0x40 else bytes([object_index]))
+    if (source & 0x0F) != 0x02 and target_offset is not None:
+        body += struct.pack("<I" if flags & 0x10 else "<H", target_offset)
+    return body
+
+
+def _with_fixups(image: bytes, records_by_page: list[bytes]) -> bytes:
+    """Append a fixup page table and record table, then point the LE header at them."""
+    page_count = struct.unpack_from("<I", image, LE_OFFSET + 0x14)[0]
+    table_position = len(image)
+    blob = bytearray()
+    offsets = []
+    for raw in records_by_page:
+        offsets.append(len(blob))
+        blob += raw
+    offsets.append(len(blob))
+    while len(offsets) < page_count + 1:
+        offsets.append(len(blob))
+    table = b"".join(struct.pack("<I", offset) for offset in offsets)
+    data = bytearray(image) + table + bytes(blob)
+    struct.pack_into("<I", data, LE_OFFSET + 0x30, len(table) + len(blob))
+    struct.pack_into("<I", data, LE_OFFSET + 0x68, table_position - LE_OFFSET)
+    struct.pack_into("<I", data, LE_OFFSET + 0x6C, table_position + len(table) - LE_OFFSET)
+    return bytes(data)
+
+
+def _patched_u32(image: bytes, offset: int, value: int) -> bytes:
+    data = bytearray(image)
+    struct.pack_into("<I", data, offset, value)
     return bytes(data)
 
 
@@ -274,6 +311,119 @@ def test_extraction_does_not_modify_the_source(tmp_path):
     assert path.read_bytes() == before
 
 
+def test_fixups_decode_internal_records_per_logical_page(tmp_path):
+    first = _record(0x07, 0x00, 0x1B, object_index=2, target_offset=0x0004)
+    second = _record(0x07, 0x00, 0x2F, object_index=2, target_offset=0x00E4)
+    third = _record(0x07, 0x00, 0x12, object_index=1, target_offset=0x012E)
+    path = _write(tmp_path, _with_fixups(_le_image(virtual_size=0x2000), [first + second, third]))
+
+    first_page = inspect_le_fixups(path, 0)
+    assert first_page["schema"] == "ddt.le-fixups.v1"
+    assert first_page["page"]["object"] == 1
+    assert first_page["page"]["object_page"] == 0
+    assert first_page["page"]["page_map_index"] == 1
+    assert first_page["page"]["page_file_offset"] == DATA_PAGES_OFFSET
+    assert first_page["page"]["record_table_offset"] == 0
+    assert first_page["page"]["record_table_end"] == 14
+    assert first_page["record_count"] == 2
+    assert first_page["undecoded"] is None
+    assert [record["bytes_hex"] for record in first_page["records"]] == \
+        ["07001B00020400", "07002F0002E400"]
+    assert [record["source_offset"] for record in first_page["records"]] == [0x1B, 0x2F]
+    assert [record["source_file_offset"] for record in first_page["records"]] == \
+        [DATA_PAGES_OFFSET + 0x1B, DATA_PAGES_OFFSET + 0x2F]
+    assert [record["target_offset"] for record in first_page["records"]] == [4, 0xE4]
+    assert first_page["records"][0] == {
+        "file_offset": first_page["records"][0]["file_offset"], "bytes_hex": "07001B00020400",
+        "source_type": 7, "source_type_name": "offset32", "source_flags": 0x07,
+        "source_offset": 0x1B, "source_file_offset": DATA_PAGES_OFFSET + 0x1B,
+        "source_within_page": True, "target_type": "internal", "target_object": 2,
+        "target_offset": 4, "target_offset_width": 2, "target_object_16bit": False}
+
+    second_page = inspect_le_fixups(path, 1)
+    assert second_page["page"]["object"] == 1
+    assert second_page["page"]["object_page"] == 1
+    assert second_page["record_count"] == 1
+    assert second_page["records"][0]["bytes_hex"] == "07001200012E01"
+    assert second_page["records"][0]["target_offset"] == 0x12E
+
+
+def test_fixups_report_a_page_without_records(tmp_path):
+    path = _write(tmp_path, _with_fixups(_le_image(virtual_size=0x2000),
+                                         [_record(0x07, 0x00, 1, 2, 3)]))
+    record = inspect_le_fixups(path, 1)
+    assert record["record_count"] == 0
+    assert record["records"] == []
+    assert record["undecoded"] is None
+    assert record["page"]["record_table_offset"] == record["page"]["record_table_end"]
+
+
+def test_fixups_decode_object_and_offset_width_variants(tmp_path):
+    wide = _record(0x07, 0x50, 0x20, object_index=0x0102, target_offset=0x00000123)
+    path = _write(tmp_path, _with_fixups(_le_image(virtual_size=0x2000), [wide]))
+    record = inspect_le_fixups(path, 0)["records"][0]
+    assert record["bytes_hex"] == "07502000020123010000"
+    assert record["target_object"] == 0x0102
+    assert record["target_object_16bit"] is True
+    assert record["target_offset"] == 0x123
+    assert record["target_offset_width"] == 4
+
+
+def test_fixups_segment_source_carries_no_target_offset(tmp_path):
+    segment = _record(0x02, 0x00, 0x10, object_index=3)
+    path = _write(tmp_path, _with_fixups(_le_image(virtual_size=0x2000), [segment]))
+    record = inspect_le_fixups(path, 0)["records"][0]
+    assert record["source_type_name"] == "segment"
+    assert record["target_object"] == 3
+    assert record["target_offset"] is None
+    assert record["target_offset_width"] is None
+
+
+def test_fixups_report_a_source_outside_the_page(tmp_path):
+    outside = _record(0x07, 0x00, 0xFFFF, object_index=2, target_offset=0x012D)
+    path = _write(tmp_path, _with_fixups(_le_image(virtual_size=0x2000), [outside]))
+    record = inspect_le_fixups(path, 0)["records"][0]
+    assert record["source_offset"] == 0xFFFF
+    assert record["source_file_offset"] is None
+    assert record["source_within_page"] is False
+
+
+def test_fixups_stop_at_an_unsupported_record_form(tmp_path):
+    decoded = _record(0x07, 0x00, 0x1B, object_index=2, target_offset=4)
+    unsupported = _record(0x07, 0x01, 0x2F, object_index=2, target_offset=0x100)
+    path = _write(tmp_path, _with_fixups(_le_image(virtual_size=0x2000), [decoded + unsupported]))
+    record = inspect_le_fixups(path, 0)
+    assert record["record_count"] == 1
+    assert record["undecoded"]["file_offset"] == record["records"][0]["file_offset"] + 7
+    assert record["undecoded"]["record_bytes"] == 7
+    assert "import_ordinal" in record["undecoded"]["reason"]
+
+
+def test_fixups_reject_malformed_tables_and_extents(tmp_path):
+    base = _with_fixups(_le_image(virtual_size=0x2000),
+                        [_record(0x07, 0x00, 0x1B, 2, 4)])
+    table_position = len(_le_image(virtual_size=0x2000))
+    with pytest.raises(DDTError, match="is truncated"):
+        inspect_le_fixups(_write(tmp_path, _with_fixups(
+            _le_image(virtual_size=0x2000), [b"\x07\x00\x1b\x00\x02"])), 0)
+    with pytest.raises(DDTError, match="outside the module's 2 pages"):
+        inspect_le_fixups(_write(tmp_path, base), 2)
+    with pytest.raises(DDTError, match="negative integer"):
+        inspect_le_fixups(_write(tmp_path, base), -1)
+    with pytest.raises(DDTError, match="declares no fixup page table"):
+        inspect_le_fixups(_write(tmp_path, _patched(base, 0x68, 0)), 0)
+    with pytest.raises(DDTError, match="too small for the module's pages"):
+        inspect_le_fixups(_write(tmp_path, _patched_u32(
+            base, LE_OFFSET + 0x6C, table_position - LE_OFFSET + 4)), 0)
+    with pytest.raises(DDTError, match="record table offset is past the end"):
+        inspect_le_fixups(_write(tmp_path, _patched(base, 0x6C, 0x9000)), 0)
+    with pytest.raises(DDTError, match="record table extends past the end"):
+        inspect_le_fixups(_write(tmp_path, _patched_u32(
+            base, table_position + 8, 0x9000)), 0)
+    with pytest.raises(DDTError, match="not monotonic"):
+        inspect_le_fixups(_write(tmp_path, _patched_u32(base, table_position, 0x40)), 0)
+
+
 def _dev_env():
     env = dict(os.environ)
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src") + os.pathsep + env.get("PYTHONPATH", "")
@@ -294,3 +444,15 @@ def test_cli_reports_le_header_and_bytes_schemas(tmp_path):
     assert payload["schema"] == "ddt.le-bytes.v1"
     assert payload["file_offset"] == 0x150
     assert payload["bytes_hex"] == bytes((0x150 + i) * 3 + 1 & 0xFF for i in range(4)).hex().upper()
+
+
+def test_cli_reports_le_fixups_schema(tmp_path):
+    path = _write(tmp_path, _with_fixups(_le_image(virtual_size=0x2000),
+                                         [_record(0x07, 0x00, 0x1B, 2, 4)]))
+    proc = subprocess.run([sys.executable, "-m", "ddt", "le-fixups", str(path),
+                           "--page", "0", "--json"],
+                          check=True, capture_output=True, text=True, env=_dev_env())
+    payload = json.loads(proc.stdout)
+    assert payload["schema"] == "ddt.le-fixups.v1"
+    assert payload["record_count"] == 1
+    assert payload["records"][0]["target_offset"] == 4

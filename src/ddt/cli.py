@@ -17,7 +17,7 @@ from .errors import DDTError
 from .format import inspect, map_address
 from .ghidra import export_function
 from .identify import identify
-from .linexec import extract_le_bytes, inspect_le
+from .linexec import extract_le_bytes, inspect_le, inspect_le_fixups
 from .memory import compare as compare_memory, compare_reference
 from .strings import extract
 
@@ -68,6 +68,11 @@ def main(argv: list[str] | None = None) -> int:
     leb.add_argument("--offset", required=True, type=_num, help="Object-relative byte offset")
     leb.add_argument("--length", required=True, type=int, help="Bytes to extract (1..256)")
     leb.add_argument("--json", action="store_true")
+    lfx = commands.add_parser("le-fixups",
+                              help="Inspect one logical page's encoded LE fixup records")
+    lfx.add_argument("path", type=Path)
+    lfx.add_argument("--page", required=True, type=_num, help="Zero-based logical page index")
+    lfx.add_argument("--json", action="store_true")
     cor = commands.add_parser("correlate",
                               help="Derive a candidate runtime address for an exported instruction")
     cor.add_argument("--binary", required=True, type=Path, help="Original COM or MZ executable")
@@ -199,6 +204,8 @@ def main(argv: list[str] | None = None) -> int:
             output = inspect_le(args.path)
         elif args.command == "le-bytes":
             output = extract_le_bytes(args.path, args.object, args.offset, args.length)
+        elif args.command == "le-fixups":
+            output = inspect_le_fixups(args.path, args.page)
         elif args.command == "correlate":
             output = correlate(args.binary, args.format, args.export, args.instruction,
                                args.entry_observation)
