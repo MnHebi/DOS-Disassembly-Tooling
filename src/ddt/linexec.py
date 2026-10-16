@@ -26,6 +26,7 @@ MIN_PAGE_SIZE = 0x200
 MAX_PAGES = 65536
 MAX_OBJECTS = 4096
 MAX_EXTRACT_BYTES = 256
+MAX_IMPORT_MODULES = 4096
 
 # LE page-map flag values (`bld/watcom/h/exeflat.h`: PAGE_VALID .. PAGE_RANGE) with the
 # names OpenWatcom's `wdump` prints. Only PAGE_VALID pages hold an ordinary file image.
@@ -38,18 +39,20 @@ _SOURCE_TYPES = {0x00: "byte", 0x01: "undefined", 0x02: "segment", 0x03: "pointe
                  0x08: "self_relative_offset32"}
 _TARGET_TYPES = {0x00: "internal", 0x01: "import_ordinal", 0x02: "import_name",
                  0x03: "internal_via_entry"}
+_TARGET_INTERNAL = 0x00
+_TARGET_EXT_ORD = 0x01
 _SFLAG_LIST = 0x20
 _SFLAG_FIXUP_TO_ALIAS = 0x10
 _TARGET_MASK = 0x03
 _TFLAG_OFF_32BIT = 0x10
 _TFLAG_OBJ_MOD_16BIT = 0x40
+_TFLAG_ORDINAL_8BIT = 0x80
 # Target flag bits that change a record's shape or meaning in ways this decoder does not
 # implement; each is listed with the name `bld/watcom/h/exeflat.h` gives it.
 _UNIMPLEMENTED_TARGET_FLAGS = (
     (0x04, "additive-value"),
     (0x08, "internal-chain"),
     (0x20, "32-bit-additive"),
-    (0x80, "8-bit-ordinal"),
 )
 
 _HEADER_LIMITS = [
@@ -85,9 +88,12 @@ _FIXUP_LIMITS = [
     "source_contiguous_bytes reports how many consecutive file-backed bytes follow "
     "source_file_offset within the same object and its virtual extent (capped at 8), "
     "because logical page adjacency implies neither physical file nor object adjacency",
-    "Only unadorned internal-reference records are decoded; other target forms, the list "
-    "and alias source flags, and the additive, chain, 32-bit-additive and 8-bit-ordinal "
-    "target flags stop decoding at their file offset and are reported as undecoded",
+    "Internal references and import-by-ordinal records are decoded; other target forms, "
+    "the list and alias source flags, and the additive, chain and 32-bit-additive target "
+    "flags stop decoding at their file offset and are reported as undecoded",
+    "An import record names a module and an ordinal: the imported symbol's name lives in "
+    "the other module and is not recorded here, and the address a loader assigns to an "
+    "import is never known to DDT",
     "The declared fixup-section size is reported but not used for bounds; the fixup page "
     "table's final entry bounds the record table and is checked against the file",
 ]
@@ -376,7 +382,7 @@ def _contiguous_bytes(record: dict, page_count: int, page_size: int,
 
 
 def _decode_fixup(data: bytes, cursor: int, end: int) -> dict:
-    """Decode one internal-reference LE fixup record; return it with its end offset."""
+    """Decode one LE fixup record; return it with its end offset."""
     def need(position: int, width: int) -> None:
         if position + width > end:
             raise DDTError(f"the LE fixup record at file offset {cursor} is truncated")
@@ -388,45 +394,88 @@ def _decode_fixup(data: bytes, cursor: int, end: int) -> dict:
         raise _UnsupportedFixup("list-form fixup records are not decoded")
     if source_flags & _SFLAG_FIXUP_TO_ALIAS:
         raise _UnsupportedFixup("alias-source fixup records are not decoded")
-    if flags & _TARGET_MASK:
-        raise _UnsupportedFixup(f"{_TARGET_TYPES[flags & _TARGET_MASK]} fixup records are "
-                                "not decoded")
     for bit, name in _UNIMPLEMENTED_TARGET_FLAGS:
         if flags & bit:
             raise _UnsupportedFixup(f"the {name} fixup flag (0x{bit:02X}) is not decoded")
+    target_type = flags & _TARGET_MASK
     source_type = source_flags & 0x0F
     if source_type not in _SOURCE_TYPES:
         raise _UnsupportedFixup(f"fixup source type 0x{source_type:02X} is not decoded")
     source_offset = _u16(data, cursor + 2)
     position = cursor + 4
-    if flags & _TFLAG_OBJ_MOD_16BIT:
-        need(position, 2)
-        target_object = _u16(data, position)
-        position += 2
-    else:
-        need(position, 1)
-        target_object = data[position]
-        position += 1
-    target_offset = None
-    target_width = None
-    if source_type != 0x02:                      # a segment fixup carries no target offset
-        target_width = 4 if flags & _TFLAG_OFF_32BIT else 2
-        need(position, target_width)
-        target_offset = _u32(data, position) if target_width == 4 else _u16(data, position)
-        position += target_width
-    return {
+    record = {
         "file_offset": cursor,
-        "bytes_hex": data[cursor:position].hex().upper(),
         "source_type": source_type,
         "source_type_name": _SOURCE_TYPES[source_type],
         "source_flags": source_flags,
         "source_offset": source_offset,
-        "target_type": "internal",
-        "target_object": target_object,
-        "target_offset": target_offset,
-        "target_offset_width": target_width,
-        "target_object_16bit": bool(flags & _TFLAG_OBJ_MOD_16BIT),
-    }, position
+    }
+    if target_type == _TARGET_INTERNAL:
+        if flags & _TFLAG_ORDINAL_8BIT:
+            raise _UnsupportedFixup("the 8-bit-ordinal fixup flag (0x80) is not decoded for "
+                                    "internal references")
+        if flags & _TFLAG_OBJ_MOD_16BIT:
+            need(position, 2)
+            target_object = _u16(data, position)
+            position += 2
+        else:
+            need(position, 1)
+            target_object = data[position]
+            position += 1
+        target_offset = None
+        target_width = None
+        if source_type != 0x02:                  # a segment fixup carries no target offset
+            target_width = 4 if flags & _TFLAG_OFF_32BIT else 2
+            need(position, target_width)
+            target_offset = _u32(data, position) if target_width == 4 else _u16(data, position)
+            position += target_width
+        record.update(target_type="internal", target_object=target_object,
+                      target_offset=target_offset, target_offset_width=target_width,
+                      target_object_16bit=bool(flags & _TFLAG_OBJ_MOD_16BIT))
+    elif target_type == _TARGET_EXT_ORD:
+        if flags & _TFLAG_OBJ_MOD_16BIT:
+            need(position, 2)
+            module_ordinal = _u16(data, position)
+            position += 2
+        else:
+            need(position, 1)
+            module_ordinal = data[position]
+            position += 1
+        ordinal_width = (1 if flags & _TFLAG_ORDINAL_8BIT
+                         else 4 if flags & _TFLAG_OFF_32BIT else 2)
+        need(position, ordinal_width)
+        import_ordinal = int.from_bytes(data[position:position + ordinal_width], "little")
+        position += ordinal_width
+        record.update(target_type="import_ordinal", module_ordinal=module_ordinal,
+                      import_ordinal=import_ordinal)
+    else:
+        raise _UnsupportedFixup(f"{_TARGET_TYPES[target_type]} fixup records are not decoded")
+    record["bytes_hex"] = data[cursor:position].hex().upper()
+    return record, position
+
+
+def _import_module_names(data: bytes, le: int) -> list[str]:
+    """Read the import module name table (length-prefixed names, one per module)."""
+    offset = _u32(data, le + 0x70)
+    count = _u32(data, le + 0x74)
+    if not count:
+        raise DDTError("the LE header declares no import module name table")
+    if count > MAX_IMPORT_MODULES:
+        raise DDTError("the LE import module count is outside the supported range")
+    cursor = le + offset
+    names = []
+    for _ in range(count):
+        if cursor >= len(data):
+            raise DDTError("the LE import module name table extends past the end of the file")
+        length = data[cursor]
+        cursor += 1
+        if cursor + length > len(data):
+            raise DDTError("the LE import module name table extends past the end of the file")
+        names.append(data[cursor:cursor + length].decode("latin-1"))
+        cursor += length
+    return names
+
+
 def inspect_le_fixups(path: str | Path, page: int) -> dict:
     """Report the validated fixup records of one logical LE page."""
     if isinstance(page, bool) or not isinstance(page, int) or page < 0:
@@ -465,6 +514,7 @@ def inspect_le_fixups(path: str | Path, page: int) -> dict:
     page_file_bytes = page_entry["file_bytes"] if page_entry else None
     records = []
     undecoded = None
+    import_modules = None
     page_size = header["page_size"]
     cursor = start
     while cursor < end:
@@ -485,6 +535,15 @@ def inspect_le_fixups(path: str | Path, page: int) -> dict:
         decoded["source_contiguous_bytes"] = (
             None if position is None else
             _contiguous_bytes(record, page_count, page_size, source_page, within, position))
+        if decoded["target_type"] == "import_ordinal":
+            if import_modules is None:
+                import_modules = _import_module_names(data, le)
+            module_ordinal = decoded["module_ordinal"]
+            if not 1 <= module_ordinal <= len(import_modules):
+                raise DDTError(f"the LE fixup record at file offset {decoded['file_offset']} "
+                               f"names import module ordinal {module_ordinal}, which is outside "
+                               "the import module name table")
+            decoded["import_module"] = import_modules[module_ordinal - 1]
         records.append(decoded)
     return {
         "schema": FIXUPS_SCHEMA,

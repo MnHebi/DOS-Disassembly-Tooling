@@ -101,7 +101,22 @@ def _record(source: int, flags: int, source_offset: int, object_index: int | Non
     return body
 
 
-def _with_fixups(image: bytes, records_by_page: list[bytes]) -> bytes:
+def _import_record(source: int, flags: int, source_offset: int,
+                   module_ordinal: int, import_ordinal: int) -> bytes:
+    """Encode one synthetic import-by-ordinal LE fixup record."""
+    body = bytes([source, flags]) + struct.pack("<H", source_offset)
+    body += (struct.pack("<H", module_ordinal) if flags & 0x40 else bytes([module_ordinal]))
+    if flags & 0x80:
+        body += bytes([import_ordinal])
+    elif flags & 0x10:
+        body += struct.pack("<I", import_ordinal)
+    else:
+        body += struct.pack("<H", import_ordinal)
+    return body
+
+
+def _with_fixups(image: bytes, records_by_page: list[bytes],
+                 import_modules: tuple[str, ...] = ()) -> bytes:
     """Append a fixup page table and record table, then point the LE header at them."""
     page_count = struct.unpack_from("<I", image, LE_OFFSET + 0x14)[0]
     table_position = len(image)
@@ -118,6 +133,13 @@ def _with_fixups(image: bytes, records_by_page: list[bytes]) -> bytes:
     struct.pack_into("<I", data, LE_OFFSET + 0x30, len(table) + len(blob))
     struct.pack_into("<I", data, LE_OFFSET + 0x68, table_position - LE_OFFSET)
     struct.pack_into("<I", data, LE_OFFSET + 0x6C, table_position + len(table) - LE_OFFSET)
+    if import_modules:
+        names_position = len(data)
+        for name in import_modules:
+            encoded = name.encode("ascii")
+            data += bytes([len(encoded)]) + encoded
+        struct.pack_into("<I", data, LE_OFFSET + 0x70, names_position - LE_OFFSET)
+        struct.pack_into("<I", data, LE_OFFSET + 0x74, len(import_modules))
     return bytes(data)
 
 
@@ -448,7 +470,7 @@ def test_fixups_report_no_source_offset_when_the_preceding_page_has_no_file_imag
 
 @pytest.mark.parametrize("flags,reason", [
     (0x04, "additive-value"), (0x08, "internal-chain"),
-    (0x20, "32-bit-additive"), (0x80, "8-bit-ordinal")])
+    (0x20, "32-bit-additive")])
 def test_fixups_stop_at_unimplemented_target_flags(tmp_path, flags, reason):
     ordinary = _record(0x07, 0x00, 0x1B, object_index=2, target_offset=4)
     flagged = _record(0x07, flags, 0x2F, object_index=2, target_offset=0x100)
@@ -472,13 +494,13 @@ def test_fixups_stop_at_the_alias_source_flag(tmp_path):
 
 def test_fixups_stop_at_an_unsupported_record_form(tmp_path):
     decoded = _record(0x07, 0x00, 0x1B, object_index=2, target_offset=4)
-    unsupported = _record(0x07, 0x01, 0x2F, object_index=2, target_offset=0x100)
+    unsupported = _import_record(0x07, 0x02, 0x2F, 1, 1)      # import-by-name
     path = _write(tmp_path, _with_fixups(_le_image(virtual_size=0x2000), [decoded + unsupported]))
     record = inspect_le_fixups(path, 0)
     assert record["record_count"] == 1
     assert record["undecoded"]["file_offset"] == record["records"][0]["file_offset"] + 7
     assert record["undecoded"]["record_bytes"] == 7
-    assert "import_ordinal" in record["undecoded"]["reason"]
+    assert "import_name" in record["undecoded"]["reason"]
 
 
 def test_fixups_reject_malformed_tables_and_extents(tmp_path):
@@ -560,6 +582,82 @@ def test_fixup_source_contiguity_is_bounded_by_page_backing_and_order(tmp_path):
     record = inspect_le_fixups(swapped, 0)["records"][0]
     assert record["source_file_offset"] == DATA_PAGES_OFFSET + 0x1FFF
     assert record["source_contiguous_bytes"] == 1     # the next page sits earlier in the file
+
+
+def test_fixups_decode_an_import_by_ordinal(tmp_path):
+    # The verified form: source 0x08 (self-relative offset32), flags 0x81
+    # (import-by-ordinal + 8-bit ordinal), module ordinal 1, import ordinal 1.
+    imported = _import_record(0x08, 0x81, 0x26, module_ordinal=1, import_ordinal=1)
+    following = _record(0x07, 0x00, 0x3B, object_index=2, target_offset=4)
+    path = _write(tmp_path, _with_fixups(_le_image(virtual_size=0x2000),
+                                         [imported + following], import_modules=("mylib",)))
+    record = inspect_le_fixups(path, 0)
+    assert record["undecoded"] is None
+    assert record["record_count"] == 2
+    assert record["records"][0] == {
+        "file_offset": record["records"][0]["file_offset"], "bytes_hex": "088126000101",
+        "source_type": 8, "source_type_name": "self_relative_offset32", "source_flags": 0x08,
+        "source_offset": 0x26, "source_offset_signed": 0x26, "source_page": 0,
+        "source_file_offset": DATA_PAGES_OFFSET + 0x26, "source_within_page": True,
+        "source_contiguous_bytes": 8, "target_type": "import_ordinal", "module_ordinal": 1,
+        "import_ordinal": 1, "import_module": "mylib"}
+    # decoding resumes at the following record, which is an ordinary internal one
+    assert record["records"][1]["file_offset"] == record["records"][0]["file_offset"] + 6
+    assert record["records"][1]["target_type"] == "internal"
+    assert record["records"][1]["target_offset"] == 4
+
+
+@pytest.mark.parametrize("flags,module_ordinal,import_ordinal", [
+    (0x41, 0x0123, 5),        # 16-bit module ordinal
+    (0x01, 1, 0x1234),        # 16-bit import ordinal
+    (0x81, 1, 200),           # 8-bit import ordinal
+    (0x11, 1, 0x00012345)])   # 32-bit import ordinal
+def test_fixups_decode_import_ordinal_width_variants(tmp_path, flags, module_ordinal,
+                                                     import_ordinal):
+    imported = _import_record(0x07, flags, 0x26, module_ordinal, import_ordinal)
+    modules = tuple(f"m{index}" for index in range(1, module_ordinal + 1))
+    path = _write(tmp_path, _with_fixups(_le_image(virtual_size=0x2000), [imported],
+                                         import_modules=modules))
+    record = inspect_le_fixups(path, 0)["records"][0]
+    assert record["target_type"] == "import_ordinal"
+    assert record["module_ordinal"] == module_ordinal
+    assert record["import_ordinal"] == import_ordinal
+    assert record["bytes_hex"] == imported.hex().upper()
+    assert record["import_module"] == modules[module_ordinal - 1]
+
+
+def test_fixups_reject_import_records_with_bad_ordinals_or_tables(tmp_path):
+    image = _le_image(virtual_size=0x2000)
+    no_table = _write(tmp_path, _with_fixups(
+        image, [_import_record(0x08, 0x81, 0x26, 1, 1)]))
+    with pytest.raises(DDTError, match="declares no import module name table"):
+        inspect_le_fixups(no_table, 0)
+    beyond = _write(tmp_path, _with_fixups(
+        image, [_import_record(0x08, 0x81, 0x26, 3, 1)], import_modules=("mylib",)))
+    with pytest.raises(DDTError, match="module ordinal 3"):
+        inspect_le_fixups(beyond, 0)
+    truncated = _write(tmp_path, _with_fixups(
+        image, [bytes([0x08, 0x81, 0x26, 0x00, 0x01])], import_modules=("mylib",)))
+    with pytest.raises(DDTError, match="is truncated"):
+        inspect_le_fixups(truncated, 0)
+
+
+def test_fixups_reject_an_out_of_bounds_import_module_table(tmp_path):
+    records = [_import_record(0x08, 0x81, 0x26, 1, 1)]
+    image = _with_fixups(_le_image(virtual_size=0x2000), records, import_modules=("mylib",))
+    path = _write(tmp_path, _patched(image, 0x70, 0x9000))
+    with pytest.raises(DDTError, match="import module name table extends past"):
+        inspect_le_fixups(path, 0)
+
+
+def test_fixups_stop_at_internal_reference_ordinal_flag(tmp_path):
+    ordinary = _record(0x07, 0x00, 0x1B, object_index=2, target_offset=4)
+    flagged = _record(0x07, 0x80, 0x2F, object_index=2, target_offset=0x100)
+    path = _write(tmp_path, _with_fixups(_le_image(virtual_size=0x2000), [ordinary + flagged]))
+    record = inspect_le_fixups(path, 0)
+    assert record["record_count"] == 1
+    assert "8-bit-ordinal" in record["undecoded"]["reason"]
+    assert "internal" in record["undecoded"]["reason"]
 
 
 def _dev_env():
