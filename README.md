@@ -70,6 +70,19 @@ python -m pytest -q
 
 See [docs/BLUEPRINT.md](docs/BLUEPRINT.md) for the design and roadmap.
 
+## Agent Skill (optional)
+
+`skills/ddt-dos-reverse-engineering/` is a portable [Agent Skill](https://developers.openai.com/codex/skills) that teaches an AI coding agent to select and interpret DDT's existing commands: container identification, COM/MZ and LE structure, fixup and relocation reading, original-file offset mapping, bounded byte extraction, artifact comparison, and the optional runtime and Ghidra evidence paths. It is **instructions only** — no new analysis code, no dependencies, and no MCP server; everything it describes runs through the ordinary `ddt` CLI.
+
+The skill is optional and purely additive: DDT, its packaging and its test suite work exactly the same without it. Install it by copying or symlinking the folder into a location your agent scans (Codex reads repository, user, admin and bundled locations, and follows symlinked skill folders):
+
+```sh
+mkdir -p .agents/skills && cp -r skills/ddt-dos-reverse-engineering .agents/skills/   # repo-scoped
+cp -r skills/ddt-dos-reverse-engineering "$HOME/.agents/skills/"                      # user-scoped
+```
+
+Codex discovers new skills automatically; restart it if the skill does not appear. Other Agent Skills-compatible clients read `SKILL.md` from their own skill directory, so point them at the same folder. The skill's `SKILL.md` is the entry point; `references/commands.md` and `references/evidence.md` are loaded only when a task needs them.
+
 ## Ghidra integration (optional)
 
 `ddt ghidra export` runs Ghidra's headless analyzer in process mode against an **existing, saved** project to describe one already-analyzed function. It uses `-process -readOnly -noanalysis` and a bundled GhidraScript (`ddt/ghidra_scripts/ExportFunction.java`); it never imports, re-analyzes, overwrites, or commits to the project, and never modifies the original executable. The command is optional and self-contained: without it, DDT has no Ghidra dependency.
