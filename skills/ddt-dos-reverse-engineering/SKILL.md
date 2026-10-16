@@ -1,6 +1,6 @@
 ---
 name: ddt-dos-reverse-engineering
-description: Investigate 16-bit DOS executables (COM, real-mode MZ, and LE/DOS-extender containers) with the DDT command line - container identification, header/relocation/fixup inspection, original-file offset mapping, bounded byte extraction, artifact and binary comparison, and optional DOSBox-X or Ghidra evidence. Use when a task involves a DOS .COM/.EXE/LE binary, its relocations or fixups, or correlating static bytes with observed DOS runtime state. Not for Windows PE/NE or non-DOS formats, and not a replacement for a full disassembler.
+description: Investigate DOS executables - 16-bit COM and real-mode MZ images plus LE/DOS-extender containers whose payloads are 32-bit - with the DDT command line, covering container identification, header/relocation/fixup inspection, original-file offset mapping, bounded byte extraction, artifact and binary comparison, and optional DOSBox-X or Ghidra evidence. Use when a task involves a DOS .COM/.EXE/LE binary, its relocations or fixups, or correlating static bytes with observed DOS runtime state. Not for Windows PE/NE or non-DOS formats, and not a replacement for a full disassembler.
 ---
 
 # DDT: DOS Executable Evidence
@@ -14,8 +14,9 @@ evidence supports and what it does not.
 ## Before anything else
 
 1. Confirm DDT is available: `ddt --version`. If there is no `ddt` script but a
-   checkout is present, run it as `PYTHONPATH=src python -m ddt ...`. Every command
-   prints JSON on stdout, so `--json` is optional.
+   checkout is present, run it as `PYTHONPATH=src python -m ddt ...`. When DDT MCP
+   tools are already connected, availability is established - skip the probe. Every
+   command prints JSON on stdout, so `--json` is optional.
 2. Record the input's identity before interpreting it: `ddt manifest FILE` gives the
    SHA-256. Quote that hash in conclusions, and reuse earlier receipts only when the
    hash still matches.
@@ -38,7 +39,7 @@ only asks about file structure must not require them.
 | Question | Command |
 | --- | --- |
 | What kind of container is this? | `ddt identify FILE` |
-| COM/MZ header, relocations, overlay | `ddt inspect FILE [--format com]` |
+| COM/MZ header, relocations, overlay | `ddt inspect FILE [--format com]` (MZ/COM only; an LE-hosted image is refused - use the LE commands below) |
 | Where in the file is module-relative `seg:off`? | `ddt address FILE --segment S --offset O` |
 | LE/DOS-extender header, objects, pages | `ddt le-header FILE` |
 | Bytes of one LE object/page | `ddt le-bytes FILE --object N --offset O --length L` |

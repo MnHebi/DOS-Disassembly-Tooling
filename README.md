@@ -115,6 +115,29 @@ args = ["--root", "/path/to/authorized/analysis"]
 
 The same server can be registered from the CLI: `codex mcp add ddt -- ddt-mcp --root /path/to/authorized/analysis`. Installing DDT without the extra changes nothing: the SDK is imported lazily, `ddt-mcp` exits with an installation hint, and the frozen PyInstaller builds still contain only the core.
 
+**Tested setup and acceptance.** Verified end-to-end with Codex CLI 0.155.1 on Linux. Two steps need operator action; the last one is a single non-interactive session.
+
+```sh
+# 1. operator: install the skill (copy or symlink) and check it is discoverable
+mkdir -p "$HOME/.agents/skills" && ln -s "$PWD/skills/ddt-dos-reverse-engineering" \
+    "$HOME/.agents/skills/ddt-dos-reverse-engineering"
+
+# 2. operator: register the server. Use `codex mcp add ddt -- ddt-mcp --root DIR` for a
+#    permanent entry, or scope it to one run without touching ~/.codex/config.toml:
+codex exec --ephemeral --skip-git-repo-check -C /tmp/scratch -s read-only -o out.txt \
+  -c 'mcp_servers.ddt.command="ddt-mcp"' \
+  -c 'mcp_servers.ddt.args=["--root","/path/to/authorized/analysis"]' \
+  "Using the ddt-dos-reverse-engineering skill, identify PROGRAM.EXE with the DDT MCP tools."
+
+# 3. the acceptance signals, all observable in that run
+#    - the session's skill list contains ddt-dos-reverse-engineering
+#    - the six ddt_* tools are listed
+#    - a call returns a ddt.* schema whose sha256 equals `ddt manifest PROGRAM.EXE`
+#    - a path outside --root is refused, and the refusal is accepted, not worked around
+```
+
+Observed in that session: the skill was selected without being named by `$skill`, the agent read its `SKILL.md`, called `ddt_manifest`/`ddt_identify`/`ddt_le_header`/`ddt_le_fixups` through the server, matched the CLI's SHA-256 and entry file offset, reported the import-by-ordinal record as `module mylib, ordinal 1` while stating that the symbol name and loader-assigned address are **not established**, and treated an out-of-root refusal as a boundary rather than working around it.
+
 ## Ghidra integration (optional)
 
 `ddt ghidra export` runs Ghidra's headless analyzer in process mode against an **existing, saved** project to describe one already-analyzed function. It uses `-process -readOnly -noanalysis` and a bundled GhidraScript (`ddt/ghidra_scripts/ExportFunction.java`); it never imports, re-analyzes, overwrites, or commits to the project, and never modifies the original executable. The command is optional and self-contained: without it, DDT has no Ghidra dependency.
