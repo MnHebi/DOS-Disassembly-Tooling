@@ -1,8 +1,12 @@
 """Structural checks for the shipped Agent Skill (no YAML dependency needed)."""
 from __future__ import annotations
 
+import importlib.util
 import re
+import zipfile
 from pathlib import Path
+
+import ddt
 
 SKILL_ROOT = Path(__file__).resolve().parents[1] / "skills"
 ALLOWED_KEYS = {"name", "description", "license", "allowed-tools", "metadata"}
@@ -45,3 +49,23 @@ def test_referenced_files_exist():
             if "://" in target:
                 continue
             assert (skill / target).is_file(), f"{skill.name}: missing {target}"
+
+
+def _archive_script():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "archive_skill.py"
+    spec = importlib.util.spec_from_file_location("archive_skill", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_skill_archive_holds_only_the_three_skill_files(tmp_path):
+    archive = _archive_script().build(tmp_path)
+    assert archive.name == f"DDT-{ddt.__version__}-skill.zip"
+    with zipfile.ZipFile(archive) as opened:
+        members = sorted(name for name in opened.namelist() if not name.endswith("/"))
+    assert members == [
+        "ddt-dos-reverse-engineering/SKILL.md",
+        "ddt-dos-reverse-engineering/references/commands.md",
+        "ddt-dos-reverse-engineering/references/evidence.md",
+    ]

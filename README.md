@@ -1,12 +1,12 @@
 # DOS Disassembly Tooling (DDT)
 
-A small, read-only, cross-platform toolkit for examining 16-bit DOS executables. One Python source tree runs on Linux x86-64 and Windows x86-64. It is deliberately not a full disassembler: the goal is reliable, machine-readable inspection, address mapping and binary comparison that work offline, with no Ghidra, emulator or network dependency.
+A small, read-only, cross-platform toolkit for examining DOS executables: 16-bit COM and real-mode MZ images, plus the LE/DOS-extender containers used by 32-bit DOS programs. One Python source tree runs on Linux x86-64 and Windows x86-64. It is deliberately not a full disassembler: the goal is reliable, machine-readable inspection, address mapping and binary comparison that work offline, with no Ghidra, emulator or network dependency.
 
 ## Supported inputs
 
 - DOS MZ executables: header, relocation table and overlay are validated; NE, LE, LX and PE binaries are rejected rather than treated as DOS MZ payloads.
 - Headerless COM images, selected explicitly with `--format com`.
-- Other containers (NE/LE/LX/PE stubs, embedded COFF, common packers) are only **identified** by `ddt identify`; `LE` can additionally be structurally inspected and its file-backed pages extracted with `ddt le-header`/`ddt le-bytes`, and none of them are loaded or executed.
+- Other containers (NE/LE/LX/PE stubs, embedded COFF, common packers) are only **identified** by `ddt identify`. An `LE` (linear executable / DOS-extender) container goes further: `ddt le-header` validates its header, object table and page map, `ddt le-bytes` extracts bounded original-file bytes from one file-backed page, and `ddt le-fixups` reads the encoded relocation records a loader would be asked to apply. LE payloads are 32-bit. None of these images are loaded, relocated, decompressed or executed.
 - Arbitrary files and directories for hashing and byte-level comparison.
 
 ## Implemented now
@@ -40,7 +40,16 @@ A small, read-only, cross-platform toolkit for examining 16-bit DOS executables.
 ## Installation and usage
 
 ```sh
-python -m pip install -e .
+python -m venv .ddt-venv                                  # isolated environment (Windows: py -m venv .ddt-venv)
+. .ddt-venv/bin/activate                                  # Windows: .ddt-venv\Scripts\activate
+python -m pip install .                                   # core CLI only; no runtime dependencies
+python -m pip install ".[mcp]"                            # core CLI plus the optional MCP server
+ddt --version
+```
+
+Installing from a source checkout with `-e .` instead of `.` picks up later edits. The examples below assume the environment above is active; outside it, use the absolute path to the console script, for example `.ddt-venv/bin/ddt`.
+
+```sh
 ddt inspect GAME.EXE --json
 ddt inspect GAME.COM --format com --json
 ddt address GAME.EXE --segment 0x1234 --offset 0x100 --json
@@ -83,6 +92,16 @@ mkdir -p "$HOME/.agents/skills" && cp -r skills/ddt-dos-reverse-engineering "$HO
 
 Codex discovers new skills automatically; restart it if the skill does not appear. Other Agent Skills-compatible clients read `SKILL.md` from their own skill directory, so point them at the same folder. The skill's `SKILL.md` is the entry point; `references/commands.md` and `references/evidence.md` are loaded only when a task needs them.
 
+The skill is **not** inside the wheel or the frozen binaries, so it also ships as a small archive that needs no repository checkout:
+
+```sh
+python scripts/archive_skill.py          # writes release/DDT-0.1.0-skill.zip
+mkdir -p "$HOME/.agents/skills"
+unzip -o release/DDT-0.1.0-skill.zip -d "$HOME/.agents/skills"
+```
+
+Installing the skill does **not** install DDT: it only describes how to drive the `ddt` CLI or an already-connected DDT MCP server, so install one of those first (see [Installation and usage](#installation-and-usage)). Registering the MCP server does not install the skill either — the two are independent, and each works without the other.
+
 ## MCP server (optional)
 
 ```sh
@@ -105,34 +124,49 @@ The `mcp` extra adds `ddt-mcp`, a local **stdio** MCP server that exposes a boun
 
 **Response size.** A receipt larger than 256 KiB is returned as an explicit size-limit error naming the limit and the actual size, with a suggestion to narrow the request. DDT never truncates a receipt and presents it as complete.
 
-Client configuration (Codex reads `[mcp_servers.<name>]` stdio tables from `config.toml`; `command`, `args` and `cwd` are the documented keys):
+Client configuration (Codex reads `[mcp_servers.<name>]` stdio tables from `config.toml`; `command`, `args` and `cwd` are the documented keys). Give the **absolute** path to the console script inside the environment where you installed the extra: TOML neither expands `~`/`$HOME` nor relies on your interactive `PATH`, and a client may start the server from another working directory.
 
 ```toml
 [mcp_servers.ddt]
-command = "ddt-mcp"
+command = "/home/you/analysis/.ddt-venv/bin/ddt-mcp"
 args = ["--root", "/path/to/authorized/analysis"]
 ```
 
-The same server can be registered from the CLI: `codex mcp add ddt -- ddt-mcp --root /path/to/authorized/analysis`. Installing DDT without the extra changes nothing: the SDK is imported lazily, `ddt-mcp` exits with an installation hint, and the frozen PyInstaller builds still contain only the core.
+That table is a **permanent** registration: it applies to every later session. To register the same server permanently from the CLI (the `--` separates client options from the server command):
+
+```sh
+codex mcp add ddt -- /home/you/analysis/.ddt-venv/bin/ddt-mcp --root /path/to/authorized/analysis
+codex mcp list     # confirm the entry
+```
+
+For a **temporary** registration that leaves `~/.codex/config.toml` untouched, pass the same values as config overrides to one run (see the tested procedure below). Registering the server does not install the Agent Skill, and installing the skill does not register a server.
+
+Installing DDT without the extra changes nothing: the SDK is imported lazily, `ddt-mcp` exits with an installation hint, and the frozen PyInstaller builds still contain only the core.
 
 **Tested setup and acceptance.** Verified end-to-end with Codex CLI 0.155.1 on Linux. Two steps need operator action; the last one is a single non-interactive session.
 
 ```sh
-# 1. operator: install the skill (copy or symlink) and check it is discoverable
-mkdir -p "$HOME/.agents/skills" && ln -s "$PWD/skills/ddt-dos-reverse-engineering" \
-    "$HOME/.agents/skills/ddt-dos-reverse-engineering"
+# 1. operator: install the skill, then check the client can see it
+mkdir -p "$HOME/.agents/skills"
+unzip -o release/DDT-0.1.0-skill.zip -d "$HOME/.agents/skills"   # or: ln -s "$PWD/skills/ddt-dos-reverse-engineering" "$HOME/.agents/skills/"
 
-# 2. operator: register the server. Use `codex mcp add ddt -- ddt-mcp --root DIR` for a
-#    permanent entry, or scope it to one run without touching ~/.codex/config.toml:
-codex exec --ephemeral --skip-git-repo-check -C /tmp/scratch -s read-only -o out.txt \
-  -c 'mcp_servers.ddt.command="ddt-mcp"' \
-  -c 'mcp_servers.ddt.args=["--root","/path/to/authorized/analysis"]' \
-  "Using the ddt-dos-reverse-engineering skill, identify PROGRAM.EXE with the DDT MCP tools."
+# 2. operator: fill in absolute paths - a client does not inherit your shell or PATH
+DDT_ENV=/home/you/analysis/.ddt-venv        # where you installed the [mcp] extra
+ROOT=/home/you/analysis/sample              # authorized root; holds the DOS file to test
+mkdir -p /tmp/ddt-scratch
 
-# 3. the acceptance signals, all observable in that run
+# 3. one non-interactive session; --json makes the tool calls auditable evidence
+codex exec --json --ephemeral --skip-git-repo-check -C /tmp/ddt-scratch -s read-only \
+  -o /tmp/ddt-scratch/final.txt \
+  -c "mcp_servers.ddt.command=\"$DDT_ENV/bin/ddt-mcp\"" \
+  -c "mcp_servers.ddt.args=[\"--root\",\"$ROOT\"]" \
+  "Using the ddt-dos-reverse-engineering skill, identify PROGRAM.EXE (a file inside $ROOT) with the DDT MCP tools and report the receipt schema and SHA-256; then try a path outside $ROOT and report exactly what the server answers." \
+  | tee /tmp/ddt-scratch/events.jsonl
+
+# 4. acceptance signals, read from events.jsonl (one JSON event per line)
 #    - the session's skill list contains ddt-dos-reverse-engineering
-#    - the six ddt_* tools are listed
-#    - a call returns a ddt.* schema whose sha256 equals `ddt manifest PROGRAM.EXE`
+#    - the six ddt_* tools are listed and at least one mcp_tool_call completes
+#    - the returned ddt.* receipt's sha256 equals `ddt manifest <that file>`
 #    - a path outside --root is refused, and the refusal is accepted, not worked around
 ```
 
@@ -233,7 +267,9 @@ The evidence rules are explicit in the record: a changed byte shows the observed
 
 ## Distribution builds
 
-GitHub Actions `.github/workflows/build.yml` runs the tests and produces PyInstaller `onedir` artifacts on Ubuntu and Windows using native runners. A Windows executable must be built **on a Windows runner**; no Windows binary is included in this source tree. Local build commands are documented in the blueprint.
+GitHub Actions `.github/workflows/build.yml` runs the tests and produces two platform artifacts on Ubuntu and Windows using native runners: the PyInstaller `onedir` build of the `ddt` CLI (`scripts/archive_release.py`) and the Agent Skill archive (`scripts/archive_skill.py`). A Windows executable must be built **on a Windows runner**; no Windows binary is included in this source tree. Local build commands are documented in the blueprint.
+
+Installing from source or from a wheel gives the `ddt` CLI and, with the `mcp` extra, the `ddt-mcp` entry point; neither includes the Agent Skill, which ships as its own archive. The frozen builds contain the CLI only — `ddt-mcp` is deliberately excluded, so the MCP SDK never enters the core distribution.
 
 ## Safety and limits
 
