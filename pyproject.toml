@@ -16,9 +16,11 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pyinstaller>=6"]
+mcp = ["mcp>=2.3,<3"]
 
 [project.scripts]
 ddt = "ddt.cli:main"
+ddt-mcp = "ddt.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

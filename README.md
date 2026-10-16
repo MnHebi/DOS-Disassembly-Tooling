@@ -72,16 +72,48 @@ See [docs/BLUEPRINT.md](docs/BLUEPRINT.md) for the design and roadmap.
 
 ## Agent Skill (optional)
 
-`skills/ddt-dos-reverse-engineering/` is a portable [Agent Skill](https://developers.openai.com/codex/skills) that teaches an AI coding agent to select and interpret DDT's existing commands: container identification, COM/MZ and LE structure, fixup and relocation reading, original-file offset mapping, bounded byte extraction, artifact comparison, and the optional runtime and Ghidra evidence paths. It is **instructions only** — no new analysis code, no dependencies, and no MCP server; everything it describes runs through the ordinary `ddt` CLI.
+`skills/ddt-dos-reverse-engineering/` is a portable [Agent Skill](https://developers.openai.com/codex/skills) that teaches an AI coding agent to select and interpret DDT's existing commands: container identification, COM/MZ and LE structure, fixup and relocation reading, original-file offset mapping, bounded byte extraction, artifact comparison, and the optional runtime and Ghidra evidence paths. It is **instructions only** — no new analysis code, no dependencies, and no MCP requirement; everything it describes runs through the ordinary `ddt` CLI, and it may use the MCP tools below when a client already has that server connected.
 
 The skill is optional and purely additive: DDT, its packaging and its test suite work exactly the same without it. Install it by copying or symlinking the folder into a location your agent scans (Codex reads repository, user, admin and bundled locations, and follows symlinked skill folders):
 
 ```sh
 mkdir -p .agents/skills && cp -r skills/ddt-dos-reverse-engineering .agents/skills/   # repo-scoped
-cp -r skills/ddt-dos-reverse-engineering "$HOME/.agents/skills/"                      # user-scoped
+mkdir -p "$HOME/.agents/skills" && cp -r skills/ddt-dos-reverse-engineering "$HOME/.agents/skills/"   # user-scoped
 ```
 
 Codex discovers new skills automatically; restart it if the skill does not appear. Other Agent Skills-compatible clients read `SKILL.md` from their own skill directory, so point them at the same folder. The skill's `SKILL.md` is the entry point; `references/commands.md` and `references/evidence.md` are loaded only when a task needs them.
+
+## MCP server (optional)
+
+```sh
+python -m pip install "dos-disassembly-tooling[mcp]"
+ddt-mcp --root /path/to/authorized/analysis
+```
+
+The `mcp` extra adds `ddt-mcp`, a local **stdio** MCP server that exposes a bounded read-only subset of DDT through the official Model Context Protocol Python SDK (`mcp>=2.3,<3`, currently verified against 2.3.0). It is not a second implementation: every tool calls the same Python function the CLI calls and returns the same versioned JSON receipt, including its `limits` and unknown fields. It never executes the analyzed program, never drives DOSBox-X or Ghidra, exposes no shell and no write operation, and adds no HTTP listener, daemon or state. The server is launched by an MCP client and terminates with that session; protocol messages use stdout and diagnostics use stderr only.
+
+| Tool | DDT operation |
+| --- | --- |
+| `ddt_manifest` | Hash one file (`ddt.artifact-manifest.v1`) |
+| `ddt_identify` | Identify the container (`ddt.identify.v1`) |
+| `ddt_inspect` | Inspect a COM/MZ image |
+| `ddt_le_header` | Inspect an LE header, object table and page map (`ddt.le-header.v1`) |
+| `ddt_le_bytes` | Extract bounded LE original-file bytes (`ddt.le-bytes.v1`) |
+| `ddt_le_fixups` | Inspect one logical LE page's fixups (`ddt.le-fixups.v1`) |
+
+**Authorized root.** `--root` is required and must be an existing directory. Every requested path is resolved (including symlinks) and must stay inside that directory; paths outside it, missing files, directories and non-files are refused, and a refusal never causes the server to look elsewhere. This is an **application-level** restriction, not an operating-system sandbox: it assumes the client process could otherwise read the filesystem, and does not confine the process itself.
+
+**Response size.** A receipt larger than 256 KiB is returned as an explicit size-limit error naming the limit and the actual size, with a suggestion to narrow the request. DDT never truncates a receipt and presents it as complete.
+
+Client configuration (Codex reads `[mcp_servers.<name>]` stdio tables from `config.toml`; `command`, `args` and `cwd` are the documented keys):
+
+```toml
+[mcp_servers.ddt]
+command = "ddt-mcp"
+args = ["--root", "/path/to/authorized/analysis"]
+```
+
+The same server can be registered from the CLI: `codex mcp add ddt -- ddt-mcp --root /path/to/authorized/analysis`. Installing DDT without the extra changes nothing: the SDK is imported lazily, `ddt-mcp` exits with an installation hint, and the frozen PyInstaller builds still contain only the core.
 
 ## Ghidra integration (optional)
 

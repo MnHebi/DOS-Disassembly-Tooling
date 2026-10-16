@@ -5,6 +5,26 @@ checkout). Output is JSON on stdout; `--json` is accepted everywhere and changes
 nothing. Invalid input exits non-zero with `{"error": ..., "error_type": ...}` on
 stderr. Read the `limits` array in each receipt before drawing conclusions.
 
+## MCP tools (optional, same receipts)
+
+When a client already has `ddt-mcp` connected, these read-only tools replace the
+equivalent CLI invocations. Each returns the same versioned JSON receipt, and the server
+only reads files inside the `--root` it was started with.
+
+| MCP tool | Equivalent CLI | Arguments |
+| --- | --- | --- |
+| `ddt_manifest` | `ddt manifest PATH` | `path` |
+| `ddt_identify` | `ddt identify PATH` | `path`, `format` (`auto`/`mz`/`com`) |
+| `ddt_inspect` | `ddt inspect PATH` | `path`, `format` |
+| `ddt_le_header` | `ddt le-header PATH` | `path` |
+| `ddt_le_bytes` | `ddt le-bytes PATH --object N --offset O --length L` | `path`, `object`, `offset`, `length` |
+| `ddt_le_fixups` | `ddt le-fixups PATH --page N` | `path`, `page` |
+
+Numeric arguments are integers, so convert a hex value from a receipt before passing it
+(for example `0x26` becomes `38`). A path outside the root, a missing file, a directory,
+a malformed argument or a receipt over 256 KiB comes back as a tool error naming the
+problem; it is never silently repaired, truncated or redirected.
+
 ## Static file structure
 
 ### `ddt manifest PATH`

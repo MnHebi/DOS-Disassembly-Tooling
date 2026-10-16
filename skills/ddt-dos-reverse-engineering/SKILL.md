@@ -22,6 +22,13 @@ evidence supports and what it does not.
 3. Note the exact path and hash of every input you were given. If you are asked about
    a file whose hash you have not seen, you have not established identity yet.
 
+If an MCP client already has a DDT server connected, its read-only tools
+(`ddt_manifest`, `ddt_identify`, `ddt_inspect`, `ddt_le_header`, `ddt_le_bytes`,
+`ddt_le_fixups`) return the same receipts as the equivalent CLI commands. Prefer them
+over starting new processes, and treat a refused path as a boundary: the server only
+reads inside the root it was started with, and a rejection is never a reason to look
+elsewhere. The commands below are complete on their own, with or without a server.
+
 DDT needs no DOSBox-X, no Ghidra, no network and no AI agent for static work.
 The `debugger` and `ghidra` command groups are optional integrations; a task that
 only asks about file structure must not require them.
