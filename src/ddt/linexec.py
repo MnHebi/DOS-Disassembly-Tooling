@@ -80,10 +80,11 @@ _FIXUP_LIMITS = [
     "source_file_offset is",
     "A source offset is signed: a negative value begins in the preceding logical page, so "
     "source_file_offset can name a byte outside the selected page, mapped through that "
-    "page's own file extent and never by subtracting from the selected page's offset",
+    "page's own file extent and its object's virtual extent, never by subtracting from the "
+    "selected page's offset",
     "source_contiguous_bytes reports how many consecutive file-backed bytes follow "
-    "source_file_offset (capped at 8), because logical page adjacency does not imply "
-    "physical file adjacency",
+    "source_file_offset within the same object and its virtual extent (capped at 8), "
+    "because logical page adjacency implies neither physical file nor object adjacency",
     "Only unadorned internal-reference records are decoded; other target forms, the list "
     "and alias source flags, and the additive, chain, 32-bit-additive and 8-bit-ordinal "
     "target flags stop decoding at their file offset and are reported as undecoded",
@@ -334,29 +335,41 @@ class _UnsupportedFixup(Exception):
     """A well-formed fixup record form this milestone does not decode."""
 
 
-def _source_location(record: dict, page_count: int, page_size: int,
-                     page: int, within: int) -> int | None:
-    """File offset of one byte of a logical page, or None when it has no file image."""
+def _source_position(record: dict, page_count: int, page_size: int,
+                     page: int, within: int) -> tuple[int, int, int] | None:
+    """Resolve one byte of a logical page to (object index, object offset, file offset)."""
     if not 0 <= page < page_count or not 0 <= within < page_size:
         return None
     owner = _fixup_page_owner(record, page)
     if owner is None:
         return None
-    entry = owner[0]["pages"][owner[1]]
+    obj, object_page = owner
+    object_offset = object_page * page_size + within
+    if object_offset >= obj["virtual_size"]:
+        return None
+    entry = obj["pages"][object_page]
     if entry["file_offset"] is None or within >= entry["file_bytes"]:
         return None
-    return entry["file_offset"] + within
+    return obj["index"], object_offset, entry["file_offset"] + within
+
+
+def _source_location(record: dict, page_count: int, page_size: int,
+                     page: int, within: int) -> int | None:
+    """File offset of one byte of a logical page, or None when it has no file image."""
+    position = _source_position(record, page_count, page_size, page, within)
+    return None if position is None else position[2]
 
 
 def _contiguous_bytes(record: dict, page_count: int, page_size: int,
-                      page: int, within: int, first: int) -> int:
-    """Consecutive file-backed bytes starting at ``first``, capped for bounded work."""
+                      page: int, within: int, start: tuple[int, int, int]) -> int:
+    """Consecutive bytes from ``start`` inside one object, capped for bounded work."""
     count = 1
     while count < MAX_SOURCE_CONTIGUOUS_BYTES:
         position = within + count
-        following = _source_location(record, page_count, page_size,
+        following = _source_position(record, page_count, page_size,
                                      page + position // page_size, position % page_size)
-        if following != first + count:
+        if following is None or following[0] != start[0] \
+                or following[1] != start[1] + count or following[2] != start[2] + count:
             break
         count += 1
     return count
@@ -464,14 +477,14 @@ def inspect_le_fixups(path: str | Path, page: int) -> dict:
         signed = raw_offset - 0x10000 if raw_offset & 0x8000 else raw_offset
         page_delta, within = divmod(signed, page_size)
         source_page = page + page_delta
-        location = _source_location(record, page_count, page_size, source_page, within)
+        position = _source_position(record, page_count, page_size, source_page, within)
         decoded["source_offset_signed"] = signed
         decoded["source_page"] = source_page
-        decoded["source_file_offset"] = location
-        decoded["source_within_page"] = location is not None and source_page == page
+        decoded["source_file_offset"] = None if position is None else position[2]
+        decoded["source_within_page"] = position is not None and source_page == page
         decoded["source_contiguous_bytes"] = (
-            None if location is None else
-            _contiguous_bytes(record, page_count, page_size, source_page, within, location))
+            None if position is None else
+            _contiguous_bytes(record, page_count, page_size, source_page, within, position))
         records.append(decoded)
     return {
         "schema": FIXUPS_SCHEMA,

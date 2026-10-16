@@ -27,13 +27,20 @@ def _encode_page(page_number: int, flags: int = 0) -> int:
 
 def _le_image(*, signature=b"LE", cpu=2, os_type=1, page_size=0x1000, page_count=2,
               last_page_size=0x40, object_table_offset=LE_HEADER_BYTES,
-              page_map_offset=LE_HEADER_BYTES + OBJECT_RECORD_BYTES,
-              data_pages_offset=DATA_PAGES_OFFSET, entry_object=1, entry_offset=0x40,
+              page_map_offset=None, data_pages_offset=None, entry_object=1, entry_offset=0x40,
               pages=(1, 2), page_flags=(0, 0), virtual_size=0x80, object_page_count=2,
-              order_bytes=b"\x00\x00\x00\x00\x00\x00") -> bytes:
+              extra_objects=(), order_bytes=b"\x00\x00\x00\x00\x00\x00") -> bytes:
     """Build a minimal MZ-hosted LE image from literal, hand-chosen field values."""
+    object_count = 1 + len(extra_objects)
+    if page_map_offset is None:
+        page_map_offset = (object_table_offset + object_count * OBJECT_RECORD_BYTES
+                           if extra_objects else LE_HEADER_BYTES + OBJECT_RECORD_BYTES)
+    if data_pages_offset is None:
+        data_pages_offset = (LE_OFFSET + page_map_offset + len(pages) * PAGE_MAP_ENTRY_BYTES
+                             if extra_objects else DATA_PAGES_OFFSET)
     data_pages_end = data_pages_offset + (page_count - 1) * page_size + last_page_size
-    data = bytearray(max(data_pages_end, LE_OFFSET + LE_HEADER_BYTES + object_table_offset))
+    table_end = LE_OFFSET + object_table_offset + object_count * OBJECT_RECORD_BYTES
+    data = bytearray(max(data_pages_end, table_end, data_pages_offset))
     data[0:2] = b"MZ"
     struct.pack_into("<I", data, 0x3C, LE_OFFSET)
     header = bytearray(LE_HEADER_BYTES)
@@ -50,13 +57,24 @@ def _le_image(*, signature=b"LE", cpu=2, os_type=1, page_size=0x1000, page_count
     struct.pack_into("<I", header, 0x28, page_size)
     struct.pack_into("<I", header, 0x2C, last_page_size)
     struct.pack_into("<I", header, 0x40, object_table_offset)
-    struct.pack_into("<I", header, 0x44, 1)              # one object
+    struct.pack_into("<I", header, 0x44, object_count)
     struct.pack_into("<I", header, 0x48, page_map_offset)
     struct.pack_into("<I", header, 0x80, data_pages_offset)
     struct.pack_into("<I", header, 0xAC, 0x10000)        # stack size
     data[LE_OFFSET:LE_OFFSET + LE_HEADER_BYTES] = header
-    struct.pack_into("<6I", data, LE_OFFSET + object_table_offset,
-                     virtual_size, 0x10000, 0x2045, 1, object_page_count, 0)
+    object_records = [{"virtual_size": virtual_size, "page_map_index": 1,
+                       "page_count": object_page_count, "flags": 0x2045}]
+    next_index = 1 + object_page_count
+    for extra in extra_objects:
+        object_records.append({"virtual_size": extra["virtual_size"],
+                               "page_map_index": next_index,
+                               "page_count": extra["page_count"],
+                               "flags": extra.get("flags", 0x2043)})
+        next_index += extra["page_count"]
+    for index, entry in enumerate(object_records):
+        struct.pack_into("<6I", data, LE_OFFSET + object_table_offset
+                         + index * OBJECT_RECORD_BYTES, entry["virtual_size"], 0x10000,
+                         entry["flags"], entry["page_map_index"], entry["page_count"], 0)
     for index, page_number in enumerate(pages):
         flags = page_flags[index] if index < len(page_flags) else 0
         struct.pack_into("<I", data, LE_OFFSET + page_map_offset + index * PAGE_MAP_ENTRY_BYTES,
@@ -486,6 +504,62 @@ def test_fixups_reject_malformed_tables_and_extents(tmp_path):
             base, table_position + 8, 0x9000)), 0)
     with pytest.raises(DDTError, match="not monotonic"):
         inspect_le_fixups(_write(tmp_path, _patched_u32(base, table_position, 0x40)), 0)
+
+
+def test_fixup_source_contiguity_stops_at_the_object_virtual_extent(tmp_path):
+    # Object virtual size 0x80 over a full 0x1000-byte physical page: the byte at 0x7F is
+    # the last one the object declares, so only it is safe to read from that position.
+    path = _write(tmp_path, _with_fixups(_le_image(), [_record(0x07, 0x00, 0x7F, 1, 4)]))
+    decoded = inspect_le_fixups(path, 0)["records"][0]
+    assert decoded["source_file_offset"] == DATA_PAGES_OFFSET + 0x7F
+    assert decoded["source_contiguous_bytes"] == 1
+
+
+def test_fixup_source_outside_the_object_extent_has_no_file_offset(tmp_path):
+    records = [_record(0x07, 0x00, 0x80, 1, 4), _record(0x07, 0x00, 0x100, 1, 4)]
+    path = _write(tmp_path, _with_fixups(_le_image(), [b"".join(records)]))
+    decoded = inspect_le_fixups(path, 0)["records"]
+    assert [entry["source_offset"] for entry in decoded] == [0x80, 0x100]
+    assert [entry["source_file_offset"] for entry in decoded] == [None, None]
+    assert [entry["source_contiguous_bytes"] for entry in decoded] == [None, None]
+    assert [entry["source_within_page"] for entry in decoded] == [False, False]
+
+
+def test_fixup_source_contiguity_crosses_pages_within_one_object(tmp_path):
+    path = _write(tmp_path, _with_fixups(_le_image(virtual_size=0x2000),
+                                         [_record(0x07, 0x00, 0xFFF, 1, 4)]))
+    decoded = inspect_le_fixups(path, 0)["records"][0]
+    assert decoded["source_file_offset"] == DATA_PAGES_OFFSET + 0xFFF
+    assert decoded["source_contiguous_bytes"] == 8      # page 1 belongs to the same object
+
+
+def test_fixup_source_contiguity_does_not_cross_into_another_object(tmp_path):
+    # Object 1 spans logical pages 0 and 1 with a virtual extent well past them, and its
+    # last page is immediately followed in the file by object 2's only page.
+    image = _le_image(page_count=3, pages=(1, 2, 3), page_flags=(0, 0, 0), virtual_size=0x3000,
+                      object_page_count=2,
+                      extra_objects=[{"virtual_size": 0x1000, "page_count": 1}])
+    path = _write(tmp_path, _with_fixups(image, [b"", _record(0x07, 0x00, 0xFFF, 1, 4)]))
+
+    decoded = inspect_le_fixups(path, 1)["records"][0]
+    assert decoded["source_page"] == 1
+    assert inspect_le_fixups(path, 1)["page"]["object"] == 1
+    following = inspect_le_fixups(path, 2)["page"]
+    assert following["object"] == 2                                       # a different object
+    assert following["page_file_offset"] == decoded["source_file_offset"] + 1   # yet adjacent
+    assert decoded["source_contiguous_bytes"] == 1                        # so not counted
+
+
+def test_fixup_source_contiguity_is_bounded_by_page_backing_and_order(tmp_path):
+    opaque = _write(tmp_path, _with_fixups(_le_image(virtual_size=0x2000, page_flags=(0, 3)),
+                                           [_record(0x07, 0x00, 0xFFF, 1, 4)]))
+    assert inspect_le_fixups(opaque, 0)["records"][0]["source_contiguous_bytes"] == 1
+    swapped = _write(tmp_path, _with_fixups(
+        _le_image(virtual_size=0x2000, last_page_size=0x1000, pages=(2, 1)),
+        [_record(0x07, 0x00, 0xFFF, 1, 4)]))
+    record = inspect_le_fixups(swapped, 0)["records"][0]
+    assert record["source_file_offset"] == DATA_PAGES_OFFSET + 0x1FFF
+    assert record["source_contiguous_bytes"] == 1     # the next page sits earlier in the file
 
 
 def _dev_env():
